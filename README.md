@@ -49,15 +49,12 @@ cargo install ccchat
 ccchat --account +447700000000
 ```
 
-- `--account` is the number ccchat listens on
-- By default, only messages from your own number are accepted (Note to Self)
-- Use `--allowed` to add other numbers: `--allowed +447700000001,+447700000002`
+On first start, ccchat only accepts messages from your own number (Note to Self). When someone new messages you, ccchat sends you a notification via Note to Self with their name and a one-tap `/allow` command.
 
 You can also use environment variables instead of flags:
 
 ```bash
 export CCCHAT_ACCOUNT=+447700000000
-export CCCHAT_ALLOWED=+447700000001
 ccchat
 ```
 
@@ -67,15 +64,28 @@ Copy `.env.example` to `.env` for a template.
 
 Once running, just send a message to your ccchat number from your phone. Claude will respond in the same chat.
 
+### Sender Approval
+
+By default, only you (the account owner) can chat. When someone else sends a message:
+
+1. ccchat blocks the message and notifies you via Note to Self
+2. The notification includes their name and a ready-to-use `/allow` command
+3. Reply `/allow <id>` to approve them — the approval is saved permanently
+
+Approved senders are stored in `~/.config/ccchat/allowed.json` and persist across restarts.
+
 ### Commands
 
 Type these in your chat to control ccchat:
 
 | Command | What it Does |
 |---------|-------------|
-| `/reset` | Start a fresh conversation (clears memory) |
-| `/status` | Show how long ccchat has been running, message count, and total cost |
+| `/allow <id>` | Permanently approve a sender |
+| `/revoke <id>` | Remove a sender's access |
+| `/pending` | Show blocked senders waiting for approval |
+| `/status` | Show uptime, message count, active sessions, and total cost |
 | `/model sonnet` | Switch to a different Claude model (opus, sonnet, haiku) |
+| `/reset` | Start a fresh conversation (clears memory) |
 
 Everything else you type gets sent to Claude.
 
@@ -84,7 +94,6 @@ Everything else you type gets sent to Claude.
 | Setting | Default | What it Does |
 |---------|---------|-------------|
 | `--account` | (required) | Your account identifier |
-| `--allowed` | your own number | Who's allowed to chat |
 | `--model` | opus | Which Claude model to use |
 | `--max-budget` | $5.00 | Maximum spend per message |
 | `--port` | 8080 | Port for the messenger API (auto-selects if in use) |
@@ -100,8 +109,9 @@ ccchat itself is free. You pay for Claude API usage through your Anthropic subsc
 - Check that `claude` works on its own (`claude -p "hello"`)
 - Verify your account number is correct
 
-**"Ignoring message from non-allowed sender"**
-- The sender isn't in your `--allowed` list. Add their number with `--allowed`.
+**I sent a message but nothing happened**
+- If it's from a new sender, check Note to Self for an approval notification
+- Use `/pending` in Note to Self to see blocked senders
 
 **Messages are cut off**
 - Long responses are automatically split into multiple messages. They should arrive in order.
