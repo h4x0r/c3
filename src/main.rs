@@ -207,6 +207,45 @@ async fn ensure_signal_cli_api() -> Result<String, BoxError> {
     }
 }
 
+async fn kill_stale_processes() {
+    // Kill any existing signal-cli-api processes (which also spawn signal-cli daemons)
+    let output = Command::new("pgrep")
+        .arg("-f")
+        .arg("signal-cli-api")
+        .output()
+        .await;
+
+    if let Ok(out) = output {
+        let pids = String::from_utf8_lossy(&out.stdout);
+        for pid in pids.lines() {
+            if let Ok(pid) = pid.trim().parse::<u32>() {
+                info!("Killing stale signal-cli-api (pid {pid})");
+                let _ = Command::new("kill").arg(pid.to_string()).status().await;
+            }
+        }
+    }
+
+    // Kill any orphaned signal-cli daemons
+    let output = Command::new("pgrep")
+        .arg("-f")
+        .arg("signal-cli.*daemon")
+        .output()
+        .await;
+
+    if let Ok(out) = output {
+        let pids = String::from_utf8_lossy(&out.stdout);
+        for pid in pids.lines() {
+            if let Ok(pid) = pid.trim().parse::<u32>() {
+                info!("Killing stale signal-cli daemon (pid {pid})");
+                let _ = Command::new("kill").arg(pid.to_string()).status().await;
+            }
+        }
+    }
+
+    // Brief pause to let processes release the config lock
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+}
+
 async fn start_signal_cli_api(
     binary: &str,
     port: u16,
@@ -257,6 +296,8 @@ async fn main() {
         info!("Using external signal-cli-api at {url}");
         (None, url)
     } else {
+        kill_stale_processes().await;
+
         let binary = match ensure_signal_cli_api().await {
             Ok(b) => b,
             Err(e) => {
