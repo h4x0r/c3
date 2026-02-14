@@ -12,26 +12,26 @@ use tracing::{debug, error, info, warn};
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Parser)]
-#[command(name = "c3", about = "Claude Code Chat over Signal")]
+#[command(name = "ccchat", about = "Claude Code Chat")]
 struct Args {
     /// signal-cli-api base URL
-    #[arg(long, default_value = "http://127.0.0.1:8080", env = "C3_API_URL")]
+    #[arg(long, default_value = "http://127.0.0.1:8080", env = "CCCHAT_API_URL")]
     api_url: String,
 
     /// Your Signal account number (e.g., +44...)
-    #[arg(long, env = "C3_ACCOUNT")]
+    #[arg(long, env = "CCCHAT_ACCOUNT")]
     account: String,
 
     /// Comma-separated allowed sender numbers (empty = allow all)
-    #[arg(long, env = "C3_ALLOWED")]
+    #[arg(long, env = "CCCHAT_ALLOWED")]
     allowed: Option<String>,
 
     /// Claude model to use
-    #[arg(long, default_value = "opus", env = "C3_MODEL")]
+    #[arg(long, default_value = "opus", env = "CCCHAT_MODEL")]
     model: String,
 
     /// Max budget per message in USD
-    #[arg(long, default_value_t = 5.0, env = "C3_MAX_BUDGET")]
+    #[arg(long, default_value_t = 5.0, env = "CCCHAT_MAX_BUDGET")]
     max_budget: f64,
 }
 
@@ -76,7 +76,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "c3=info".parse().unwrap()),
+                .unwrap_or_else(|_| "ccchat=info".parse().unwrap()),
         )
         .init();
 
@@ -98,7 +98,7 @@ async fn main() {
         total_cost: std::sync::atomic::AtomicU64::new(0),
     });
 
-    info!("C3 starting for account {}", state.account);
+    info!("ccchat starting for account {}", state.account);
     if let Some(ref allowed) = state.allowed {
         info!("Allowed senders: {:?}", allowed);
     } else {
@@ -251,7 +251,7 @@ fn handle_command(state: &State, sender: &str, text: &str) -> Option<String> {
         let cost = state.total_cost_usd();
         let sessions = state.sessions.len();
         return Some(format!(
-            "C3 Status\nUptime: {hours}h {mins}m\nMessages: {count}\nActive sessions: {sessions}\nTotal cost: ${cost:.4}"
+            "ccchat status\nUptime: {hours}h {mins}m\nMessages: {count}\nActive sessions: {sessions}\nTotal cost: ${cost:.4}"
         ));
     }
 

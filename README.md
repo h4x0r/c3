@@ -1,10 +1,10 @@
-# C3 - Claude Code Chat
+# ccchat - Claude Code Chat
 
 Chat with Claude AI directly from your favourite messenger. Send a message, get an intelligent response — no browser or app switching required.
 
-## What is C3?
+## What is ccchat?
 
-C3 brings Claude AI into your messaging apps. Instead of opening a separate tool, just text your questions and Claude replies in the same chat.
+ccchat brings Claude AI into your messaging apps. Instead of opening a separate tool, just text your questions and Claude replies in the same chat.
 
 - Ask questions, get answers — right where you message
 - Each person gets their own private conversation that remembers context
@@ -22,10 +22,10 @@ More messengers coming soon.
 ## How it Works
 
 ```
-You (messenger) → C3 → Claude AI → C3 → You (messenger)
+You (messenger) → ccchat → Claude AI → ccchat → You (messenger)
 ```
 
-You send a message. C3 picks it up, asks Claude, and sends the answer back. That's it.
+You send a message. ccchat picks it up, asks Claude, and sends the answer back. That's it.
 
 ## Quick Start (Signal)
 
@@ -40,15 +40,15 @@ You send a message. C3 picks it up, asks Claude, and sends the answer back. That
 
 ```bash
 # Download and build
-git clone https://github.com/h4x0r/c3.git
-cd c3
+git clone https://github.com/h4x0r/ccchat.git
+cd ccchat
 cargo build --release
 
 # Run (replace with your actual numbers)
-./target/release/c3 --account +447700000000 --allowed +447700000001
+./target/release/ccchat --account +447700000000 --allowed +447700000001
 ```
 
-- `--account` is the number C3 listens on
+- `--account` is the number ccchat listens on
 - `--allowed` controls who can use it (comma-separated numbers, or leave it out to allow everyone)
 
 ### Using Environment Variables
@@ -56,25 +56,25 @@ cargo build --release
 Instead of typing flags every time, you can set environment variables:
 
 ```bash
-export C3_ACCOUNT=+447700000000
-export C3_ALLOWED=+447700000001
-./target/release/c3
+export CCCHAT_ACCOUNT=+447700000000
+export CCCHAT_ALLOWED=+447700000001
+./target/release/ccchat
 ```
 
 Copy `.env.example` to `.env` for a template.
 
-## Using C3
+## Using ccchat
 
-Once running, just send a message to your C3 number from your phone. Claude will respond in the same chat.
+Once running, just send a message to your ccchat number from your phone. Claude will respond in the same chat.
 
 ### Commands
 
-Type these in your chat to control C3:
+Type these in your chat to control ccchat:
 
 | Command | What it Does |
 |---------|-------------|
 | `/reset` | Start a fresh conversation (clears memory) |
-| `/status` | Show how long C3 has been running, message count, and total cost |
+| `/status` | Show how long ccchat has been running, message count, and total cost |
 | `/model sonnet` | Switch to a different Claude model (opus, sonnet, haiku) |
 
 Everything else you type gets sent to Claude.
@@ -91,11 +91,11 @@ Everything else you type gets sent to Claude.
 
 ## How Much Does it Cost?
 
-C3 itself is free. You pay for Claude API usage through your Anthropic subscription. Use `/status` to check your running total, and `--max-budget` to set a per-message spending cap.
+ccchat itself is free. You pay for Claude API usage through your Anthropic subscription. Use `/status` to check your running total, and `--max-budget` to set a per-message spending cap.
 
 ## Troubleshooting
 
-**C3 starts but I don't get replies**
+**ccchat starts but I don't get replies**
 - Make sure your messenger API is running
 - Check that `claude` works on its own (`claude -p "hello"`)
 - Verify your account number is correct

@@ -1,8 +1,8 @@
 [package]
-name = "c3"
+name = "ccchat"
 version = "0.1.0"
 edition = "2021"
-description = "Claude Code Chat over Signal - bridges Signal messages to the claude CLI"
+description = "Chat with Claude AI from your favourite messenger"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
