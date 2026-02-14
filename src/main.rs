@@ -3,6 +3,7 @@ use dashmap::DashMap;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::Value;
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,10 +15,6 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Parser)]
 #[command(name = "ccchat", about = "Claude Code Chat")]
 struct Args {
-    /// signal-cli-api base URL
-    #[arg(long, default_value = "http://127.0.0.1:8080", env = "CCCHAT_API_URL")]
-    api_url: String,
-
     /// Your Signal account number (e.g., +44...)
     #[arg(long, env = "CCCHAT_ACCOUNT")]
     account: String,
@@ -33,6 +30,14 @@ struct Args {
     /// Max budget per message in USD
     #[arg(long, default_value_t = 5.0, env = "CCCHAT_MAX_BUDGET")]
     max_budget: f64,
+
+    /// signal-cli-api base URL (auto-detected when managed)
+    #[arg(long, env = "CCCHAT_API_URL")]
+    api_url: Option<String>,
+
+    /// Port for signal-cli-api (0 = auto-select free port)
+    #[arg(long, default_value_t = 8080, env = "CCCHAT_PORT")]
+    port: u16,
 }
 
 struct State {
@@ -68,6 +73,102 @@ impl State {
     }
 }
 
+/// Find a free TCP port, starting from `preferred` and incrementing.
+fn find_free_port(preferred: u16) -> u16 {
+    if preferred == 0 {
+        // Bind to port 0 to let the OS pick
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
+        return listener.local_addr().unwrap().port();
+    }
+    for port in preferred..=preferred.saturating_add(100) {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    // Fall back to OS-assigned
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
+    listener.local_addr().unwrap().port()
+}
+
+/// Check if signal-cli-api is installed, install via cargo if not.
+async fn ensure_signal_cli_api() -> Result<String, BoxError> {
+    // Check if already in PATH
+    let check = Command::new("which")
+        .arg("signal-cli-api")
+        .output()
+        .await?;
+
+    if check.status.success() {
+        let path = String::from_utf8(check.stdout)?.trim().to_string();
+        info!("Found signal-cli-api at {path}");
+        return Ok(path);
+    }
+
+    // Not found — install it
+    info!("signal-cli-api not found, installing via cargo...");
+    let install = Command::new("cargo")
+        .arg("install")
+        .arg("signal-cli-api")
+        .status()
+        .await?;
+
+    if !install.success() {
+        return Err("Failed to install signal-cli-api via cargo install".into());
+    }
+
+    // Verify it's now available
+    let check = Command::new("which")
+        .arg("signal-cli-api")
+        .output()
+        .await?;
+
+    if check.status.success() {
+        let path = String::from_utf8(check.stdout)?.trim().to_string();
+        info!("Installed signal-cli-api at {path}");
+        Ok(path)
+    } else {
+        Err("signal-cli-api installed but not found in PATH".into())
+    }
+}
+
+/// Start signal-cli-api as a child process, returning (child, api_url).
+async fn start_signal_cli_api(
+    binary: &str,
+    port: u16,
+) -> Result<(tokio::process::Child, String), BoxError> {
+    let listen_addr = format!("127.0.0.1:{port}");
+    let api_url = format!("http://{listen_addr}");
+
+    info!("Starting signal-cli-api on {listen_addr}");
+
+    let child = Command::new(binary)
+        .arg("--listen")
+        .arg(&listen_addr)
+        .kill_on_drop(true)
+        .spawn()?;
+
+    // Wait for it to be ready (up to 10 seconds)
+    let client = Client::new();
+    let health_url = format!("{api_url}/v1/health");
+    for i in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                info!("signal-cli-api ready on port {port}");
+                return Ok((child, api_url));
+            }
+            Ok(resp) => {
+                debug!("Health check attempt {i}: status {}", resp.status());
+            }
+            Err(_) => {
+                debug!("Health check attempt {i}: not ready yet");
+            }
+        }
+    }
+
+    Err(format!("signal-cli-api failed to start on port {port} within 10s").into())
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -94,10 +195,43 @@ async fn main() {
         None => vec![args.account.clone()],
     };
 
+    // Determine API URL: use explicit --api-url, or auto-manage signal-cli-api
+    let (_child, api_url) = if let Some(url) = args.api_url {
+        info!("Using external signal-cli-api at {url}");
+        (None, url)
+    } else {
+        // Auto-manage signal-cli-api lifecycle
+        let binary = match ensure_signal_cli_api().await {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Cannot find or install signal-cli-api: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        let port = find_free_port(args.port);
+        if port != args.port {
+            warn!(
+                "Port {} in use, using port {} instead",
+                args.port, port
+            );
+        }
+
+        match start_signal_cli_api(&binary, port).await {
+            Ok((child, url)) => (Some(child), url),
+            Err(e) => {
+                error!("Failed to start signal-cli-api: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // _child is held here — when main() exits or is interrupted, kill_on_drop cleans up
+
     let state = Arc::new(State {
         sessions: DashMap::new(),
         http: Client::new(),
-        api_url: args.api_url,
+        api_url,
         account: args.account,
         allowed,
         model: args.model,
@@ -109,6 +243,7 @@ async fn main() {
 
     info!("ccchat starting for account {}", state.account);
     info!("Allowed senders: {:?}", state.allowed);
+    info!("API: {}", state.api_url);
 
     let mut backoff = 1u64;
 

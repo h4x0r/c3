@@ -32,8 +32,9 @@ You send a message. ccchat picks it up, asks Claude, and sends the answer back. 
 ### What You Need
 
 1. **A Signal account** linked to [signal-cli](https://github.com/AsamK/signal-cli)
-2. **[signal-cli-api](https://github.com/h4x0r/signal-cli-api)** running on your machine
-3. **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** installed and logged in
+2. **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** installed and logged in
+
+That's it. ccchat automatically installs and manages [signal-cli-api](https://github.com/h4x0r/signal-cli-api) for you.
 
 ### Install
 
@@ -86,7 +87,8 @@ Everything else you type gets sent to Claude.
 | `--allowed` | your own number | Who's allowed to chat |
 | `--model` | opus | Which Claude model to use |
 | `--max-budget` | $5.00 | Maximum spend per message |
-| `--api-url` | localhost:8080 | Messenger API endpoint |
+| `--port` | 8080 | Port for the messenger API (auto-selects if in use) |
+| `--api-url` | (auto-managed) | Use an external messenger API instead of auto-managing |
 
 ## How Much Does it Cost?
 
@@ -95,7 +97,6 @@ ccchat itself is free. You pay for Claude API usage through your Anthropic subsc
 ## Troubleshooting
 
 **ccchat starts but I don't get replies**
-- Make sure your messenger API is running
 - Check that `claude` works on its own (`claude -p "hello"`)
 - Verify your account number is correct
 
