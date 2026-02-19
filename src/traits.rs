@@ -14,6 +14,13 @@ pub(crate) trait SignalApi: Send + Sync {
     async fn send_msg(&self, recipient: &str, message: &str) -> Result<(), AppError>;
     async fn set_typing(&self, recipient: &str, typing: bool) -> Result<(), AppError>;
     async fn download_attachment(&self, attachment: &AttachmentInfo) -> Result<PathBuf, AppError>;
+    async fn send_attachment(
+        &self,
+        recipient: &str,
+        data: &[u8],
+        content_type: &str,
+        filename: &str,
+    ) -> Result<(), AppError>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -27,6 +34,7 @@ pub(crate) trait ClaudeRunner: Send + Sync {
         files: &[PathBuf],
         sender: &str,
         max_budget: f64,
+        system_prompt: &str,
     ) -> Result<(String, Option<f64>), AppError>;
 
     async fn summarize_session(&self, session_id: &str, model: &str) -> Option<String>;
@@ -53,7 +61,7 @@ impl SignalApi for SignalApiImpl {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             error!(status = %status, body = %body, "Signal send failed");
-            return Err(format!("Send failed: {status}").into());
+            return Err(AppError::Signal(format!("Send failed: {status}")));
         }
         Ok(())
     }
@@ -119,6 +127,37 @@ impl SignalApi for SignalApiImpl {
         );
         Ok(path)
     }
+
+    async fn send_attachment(
+        &self,
+        recipient: &str,
+        data: &[u8],
+        content_type: &str,
+        filename: &str,
+    ) -> Result<(), AppError> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+        let url = format!("{}/v2/send", self.api_url);
+        let body = serde_json::json!({
+            "message": "",
+            "number": self.account,
+            "recipients": [recipient],
+            "base64_attachments": [
+                format!("data:{content_type};filename={filename};base64,{b64}")
+            ],
+        });
+
+        let resp = self.http.post(&url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            error!(status = %status, body = %body_text, "Attachment send failed");
+            return Err(AppError::Signal(format!(
+                "Attachment send failed: {status}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct ClaudeRunnerImpl;
@@ -133,6 +172,7 @@ impl ClaudeRunner for ClaudeRunnerImpl {
         files: &[PathBuf],
         sender: &str,
         max_budget: f64,
+        system_prompt: &str,
     ) -> Result<(String, Option<f64>), AppError> {
         let work_dir = crate::helpers::isolated_workdir(sender);
         std::fs::create_dir_all(&work_dir)?;
@@ -149,7 +189,7 @@ impl ClaudeRunner for ClaudeRunnerImpl {
             .arg("--max-budget-usd")
             .arg(max_budget.to_string())
             .arg("--append-system-prompt")
-            .arg(crate::NO_MEMORY_PROMPT)
+            .arg(system_prompt)
             .arg("--no-session-persistence")
             .current_dir(&work_dir)
             .env_remove("CLAUDE_CODE_ENTRYPOINT");
@@ -160,7 +200,7 @@ impl ClaudeRunner for ClaudeRunnerImpl {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("claude exited with {}: {stderr}", output.status).into());
+            return Err(AppError::Claude(format!("claude exited with {}: {stderr}", output.status)));
         }
 
         let stdout = String::from_utf8(output.stdout)?;
@@ -312,6 +352,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_signal_send_failure_returns_signal_variant() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v2/send"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let api = SignalApiImpl {
+            http: Client::new(),
+            api_url: server.uri(),
+            account: "+1234567890".to_string(),
+        };
+        let err = api.send_msg("+recipient", "hello").await.unwrap_err();
+        assert!(matches!(err, AppError::Signal(_)));
+    }
+
+    #[test]
+    fn test_signal_variant_message_preserved() {
+        let err = AppError::Signal("connection refused".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("Signal API error"), "got: {msg}");
+        assert!(msg.contains("connection refused"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_claude_variant_message_preserved() {
+        let err = AppError::Claude("model unavailable".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("Claude error"), "got: {msg}");
+        assert!(msg.contains("model unavailable"), "got: {msg}");
+    }
+
+    #[tokio::test]
     async fn test_signal_api_send_multiple_messages_via_http() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -329,5 +402,34 @@ mod tests {
         for i in 1..=3 {
             assert!(api.send_msg("+recipient", &format!("Part {i}")).await.is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn test_signal_api_send_attachment_success() {
+        let (_server, api) = setup_wiremock("POST", "/v2/send", 200).await;
+        let data = b"fake png data";
+        let result = api
+            .send_attachment("+recipient", data, "image/png", "output.png")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_signal_api_send_attachment_failure() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v2/send"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let api = SignalApiImpl {
+            http: Client::new(),
+            api_url: server.uri(),
+            account: "+1234567890".to_string(),
+        };
+        let result = api
+            .send_attachment("+recipient", b"data", "image/png", "out.png")
+            .await;
+        assert!(result.is_err());
     }
 }

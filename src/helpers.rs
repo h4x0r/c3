@@ -137,6 +137,23 @@ pub(crate) fn find_free_port(preferred: u16) -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// Extract file paths from text that point to existing files under /tmp/ccchat/.
+pub(crate) fn extract_file_references(text: &str) -> Vec<PathBuf> {
+    let prefix = "/tmp/ccchat/";
+    let mut paths = Vec::new();
+    for word in text.split_whitespace() {
+        // Strip common surrounding punctuation
+        let cleaned = word.trim_matches(|c: char| c == '`' || c == '"' || c == '\'' || c == '(' || c == ')');
+        if cleaned.starts_with(prefix) {
+            let path = PathBuf::from(cleaned);
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
 pub(crate) fn isolated_workdir(sender: &str) -> PathBuf {
     std::env::temp_dir()
         .join("ccchat")
@@ -391,5 +408,49 @@ mod tests {
     fn test_looks_truncated_ends_with_backtick() {
         let response = format!("{}`", "a".repeat(3600));
         assert!(!looks_truncated(&response));
+    }
+
+    #[test]
+    fn test_extract_file_references_none() {
+        let text = "Here is a regular response with no file paths.";
+        let refs = extract_file_references(text);
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_file_references_single_file() {
+        let dir = PathBuf::from("/tmp/ccchat");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("test_extract_{}.txt", std::process::id()));
+        std::fs::write(&path, "test content").unwrap();
+
+        let text = format!("I created the file at {}", path.display());
+        let refs = extract_file_references(&text);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0], path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_extract_file_references_multiple() {
+        let dir = PathBuf::from("/tmp/ccchat");
+        let _ = std::fs::create_dir_all(&dir);
+        let path1 = dir.join(format!("multi_a_{}.txt", std::process::id()));
+        let path2 = dir.join(format!("multi_b_{}.txt", std::process::id()));
+        std::fs::write(&path1, "a").unwrap();
+        std::fs::write(&path2, "b").unwrap();
+
+        let text = format!("Files: {} and {}", path1.display(), path2.display());
+        let refs = extract_file_references(&text);
+        assert_eq!(refs.len(), 2);
+        let _ = std::fs::remove_file(&path1);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn test_extract_file_references_ignores_nonexistent() {
+        let text = "Check /tmp/ccchat/nonexistent_file_xyz.txt for details.";
+        let refs = extract_file_references(text);
+        assert!(refs.is_empty());
     }
 }
