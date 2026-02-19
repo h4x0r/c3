@@ -3,6 +3,7 @@ mod constants;
 mod error;
 mod helpers;
 mod memory;
+mod queue;
 mod signal;
 mod state;
 mod stats;
