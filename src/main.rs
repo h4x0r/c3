@@ -1,94 +1,36 @@
+mod commands;
+mod constants;
+mod error;
+mod helpers;
+mod memory;
+mod signal;
+mod state;
+mod stats;
+mod traits;
+
 use clap::Parser;
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::net::TcpListener;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
-use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
+use commands::handle_message;
+use helpers::{find_free_port, is_command, merge_messages, truncate, voice_prompt};
+use memory::{
+    allowed_file_path, load_config_file, load_persisted_allowed, open_memory_db,
+    purge_old_messages, reload_config, save_memory, validate_config_entries,
+};
+use signal::{classify_attachment, parse_envelope, AttachmentType, ParsedEnvelope};
+use error::AppError;
+use state::{PendingSender, State};
+use traits::{ClaudeRunnerImpl, SignalApiImpl};
 
-fn hash_message(text: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
-}
-
-// --- Persistent allowed list (~/.config/ccchat/allowed.json) ---
-
-#[derive(Serialize, Deserialize, Default)]
-struct PersistedAllowed {
-    allowed: Vec<AllowedEntry>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct AllowedEntry {
-    id: String,
-    #[serde(default)]
-    name: String,
-}
-
-fn config_dir() -> PathBuf {
-    let dir = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".config")
-        .join("ccchat");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
-fn allowed_file_path() -> PathBuf {
-    config_dir().join("allowed.json")
-}
-
-fn load_persisted_allowed() -> PersistedAllowed {
-    let path = allowed_file_path();
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-        Err(_) => PersistedAllowed::default(),
-    }
-}
-
-fn save_persisted_allowed(data: &PersistedAllowed) {
-    let path = allowed_file_path();
-    match serde_json::to_string_pretty(data) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                error!("Failed to save allowed list to {}: {e}", path.display());
-            } else {
-                debug!("Saved allowed list to {}", path.display());
-            }
-        }
-        Err(e) => error!("Failed to serialize allowed list: {e}"),
-    }
-}
-
-fn persist_allow(id: &str, name: &str) {
-    let mut data = load_persisted_allowed();
-    if !data.allowed.iter().any(|e| e.id == id) {
-        data.allowed.push(AllowedEntry {
-            id: id.to_string(),
-            name: name.to_string(),
-        });
-        save_persisted_allowed(&data);
-    }
-}
-
-fn persist_revoke(id: &str) {
-    let mut data = load_persisted_allowed();
-    data.allowed.retain(|e| e.id != id);
-    save_persisted_allowed(&data);
-}
+pub(crate) const NO_MEMORY_PROMPT: &str = "IMPORTANT: Do not write to CLAUDE.md, memory files, or any persistent storage. This is a multi-user bot environment. Memory writes would contaminate other users' sessions. Use the conversation context provided to you instead.";
 
 // --- CLI args ---
 
@@ -100,11 +42,11 @@ struct Args {
     account: String,
 
     /// Claude model to use
-    #[arg(long, default_value = "opus", env = "CCCHAT_MODEL")]
+    #[arg(long, default_value = constants::DEFAULT_MODEL, env = "CCCHAT_MODEL")]
     model: String,
 
     /// Max budget per message in USD
-    #[arg(long, default_value_t = 5.0, env = "CCCHAT_MAX_BUDGET")]
+    #[arg(long, default_value_t = constants::DEFAULT_MAX_BUDGET, env = "CCCHAT_MAX_BUDGET")]
     max_budget: f64,
 
     /// signal-cli-api base URL (auto-detected when managed)
@@ -112,65 +54,37 @@ struct Args {
     api_url: Option<String>,
 
     /// Port for signal-cli-api (0 = auto-select free port)
-    #[arg(long, default_value_t = 8080, env = "CCCHAT_PORT")]
+    #[arg(long, default_value_t = constants::DEFAULT_PORT, env = "CCCHAT_PORT")]
     port: u16,
-}
 
-// --- State ---
+    /// Rate limit per sender (e.g., "5/min", "10/hour", "1/sec")
+    #[arg(long, env = "CCCHAT_RATE_LIMIT")]
+    rate_limit: Option<String>,
 
-struct State {
-    sessions: DashMap<String, SenderState>,
-    http: Client,
-    api_url: String,
-    account: String,
-    allowed_ids: DashMap<String, ()>,
-    pending_senders: DashMap<String, String>,
-    sent_hashes: DashMap<u64, ()>,
-    model: String,
-    max_budget: f64,
-    start_time: Instant,
-    message_count: AtomicU64,
-    total_cost: AtomicU64, // stored as microdollars
-}
+    /// Session TTL / auto-expiry (e.g., "4h", "30m", "1d"). 0 or omit to disable.
+    #[arg(long, env = "CCCHAT_SESSION_TTL")]
+    session_ttl: Option<String>,
 
-struct SenderState {
-    session_id: String,
-    model: String,
-    lock: Arc<Mutex<()>>,
-}
+    /// Debounce window in ms to merge burst messages (0 = disabled)
+    #[arg(long, default_value_t = constants::DEFAULT_DEBOUNCE_MS, env = "CCCHAT_DEBOUNCE_MS")]
+    debounce_ms: u64,
 
-impl State {
-    fn is_allowed(&self, sender: &str) -> bool {
-        !sender.is_empty() && self.allowed_ids.contains_key(sender)
-    }
+    /// Log output format: "text" (default) or "json" (Axiom-compatible NDJSON)
+    #[arg(long, default_value = "text", env = "CCCHAT_LOG_FORMAT")]
+    log_format: String,
 
-    fn add_cost(&self, cost: f64) {
-        let micros = (cost * 1_000_000.0) as u64;
-        self.total_cost.fetch_add(micros, Ordering::Relaxed);
-    }
+    /// Path to config file with pre-loaded allowed numbers (JSON or YAML)
+    #[arg(long, env = "CCCHAT_CONFIG")]
+    config: Option<String>,
 
-    fn total_cost_usd(&self) -> f64 {
-        self.total_cost.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    }
+    /// Port for stats HTTP endpoint (0 = disabled)
+    #[arg(long, default_value_t = 0, env = "CCCHAT_STATS_PORT")]
+    stats_port: u16,
 }
 
 // --- signal-cli-api lifecycle ---
 
-fn find_free_port(preferred: u16) -> u16 {
-    if preferred == 0 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
-        return listener.local_addr().unwrap().port();
-    }
-    for port in preferred..=preferred.saturating_add(100) {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
-    listener.local_addr().unwrap().port()
-}
-
-async fn ensure_signal_cli_api() -> Result<String, BoxError> {
+async fn ensure_signal_cli_api() -> Result<String, AppError> {
     let check = Command::new("which")
         .arg("signal-cli-api")
         .output()
@@ -249,7 +163,7 @@ async fn kill_stale_processes() {
 async fn start_signal_cli_api(
     binary: &str,
     port: u16,
-) -> Result<(tokio::process::Child, String), BoxError> {
+) -> Result<(tokio::process::Child, String), AppError> {
     let listen_addr = format!("127.0.0.1:{port}");
     let api_url = format!("http://{listen_addr}");
 
@@ -282,14 +196,24 @@ async fn start_signal_cli_api(
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ccchat=info".parse().unwrap()),
-        )
-        .init();
-
     let args = Args::parse();
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "ccchat=info".parse().unwrap());
+
+    match args.log_format.as_str() {
+        "json" => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .init();
+        }
+        _ => {
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        }
+    }
 
     // Determine API URL: use explicit --api-url, or auto-manage signal-cli-api
     let (_child, api_url) = if let Some(url) = args.api_url {
@@ -327,6 +251,26 @@ async fn main() {
         info!("Loaded: {} ({})", entry.id, entry.name);
         allowed_ids.insert(entry.id.clone(), ());
     }
+    // Load config file if provided
+    if let Some(config_path) = &args.config {
+        match load_config_file(config_path) {
+            Ok(entries) => {
+                for warning in validate_config_entries(&entries) {
+                    warn!("Config validation: {warning}");
+                }
+                for entry in &entries {
+                    info!(id = %entry.id, name = %entry.name, "Loaded allowed sender from config");
+                    allowed_ids.insert(entry.id.clone(), ());
+                }
+                info!(count = entries.len(), "Loaded allowed senders from config file");
+            }
+            Err(e) => {
+                error!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Account owner is always allowed (for admin commands via Note to Self)
     allowed_ids.insert(args.account.clone(), ());
 
@@ -350,28 +294,143 @@ async fn main() {
         }
     }
 
-    let state = Arc::new(State {
-        sessions: DashMap::new(),
-        http,
-        api_url,
-        account: args.account,
-        allowed_ids,
-        pending_senders: DashMap::new(),
-        sent_hashes: DashMap::new(),
-        model: args.model,
-        max_budget: args.max_budget,
-        start_time: Instant::now(),
-        message_count: AtomicU64::new(0),
-        total_cost: AtomicU64::new(0),
+    let rate_limit_config = args.rate_limit.as_deref().and_then(|s| {
+        let parsed = helpers::parse_rate_limit(s);
+        if parsed.is_none() {
+            error!("Invalid --rate-limit value: {s:?}. Expected format: 5/min, 10/hour, 1/sec");
+        }
+        parsed
     });
 
-    info!("ccchat starting for account {}", state.account);
+    let session_ttl = args.session_ttl.as_deref().and_then(|s| {
+        let parsed = helpers::parse_duration(s);
+        if parsed.is_none() && s != "0" {
+            error!("Invalid --session-ttl value: {s:?}. Expected format: 30s, 5m, 4h, 1d");
+        }
+        parsed
+    });
+
+    let sent_hashes = Arc::new(DashMap::new());
+    let signal_api = Box::new(SignalApiImpl {
+        http,
+        api_url: api_url.clone(),
+        account: args.account.clone(),
+    });
+
+    let state = Arc::new(State {
+        config: state::Config {
+            model: args.model,
+            max_budget: args.max_budget,
+            rate_limit_config,
+            session_ttl,
+            debounce_ms: args.debounce_ms,
+            account: args.account,
+            api_url,
+            config_path: args.config,
+        },
+        metrics: state::Metrics {
+            start_time: Instant::now(),
+            message_count: AtomicU64::new(0),
+            total_cost: AtomicU64::new(0),
+        },
+        session_mgr: state::SessionManager {
+            sessions: DashMap::new(),
+            truncated_sessions: DashMap::new(),
+        },
+        debounce: state::DebounceState {
+            buffers: DashMap::new(),
+            active: DashMap::new(),
+        },
+        allowed_ids,
+        pending_senders: DashMap::new(),
+        pending_counter: AtomicU64::new(0),
+        sent_hashes,
+        rate_limits: DashMap::new(),
+        signal_api,
+        claude_runner: Box::new(ClaudeRunnerImpl),
+    });
+
+    // Spawn session reaper task if TTL is configured
+    if let Some(ttl) = state.config.session_ttl {
+        let reaper_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let now = Instant::now();
+                // Collect expired sessions for async summarization
+                let expired: Vec<(String, String)> = reaper_state
+                    .session_mgr
+                    .sessions
+                    .iter()
+                    .filter(|entry| now.duration_since(entry.value().last_activity) > ttl)
+                    .map(|entry| (entry.key().clone(), entry.value().session_id.clone()))
+                    .collect();
+                for (sender, session_id) in &expired {
+                    info!(sender = %sender, "Session expired by TTL reaper");
+                    if let Some(summary) = reaper_state
+                        .claude_runner
+                        .summarize_session(session_id, &reaper_state.config.model)
+                        .await
+                    {
+                        save_memory(sender, &summary);
+                        info!(sender = %sender, "Saved memory on expiry");
+                    }
+                    // Purge messages older than 30 days
+                    if let Ok(conn) = open_memory_db(sender) {
+                        purge_old_messages(&conn, 30);
+                    }
+                    reaper_state.session_mgr.sessions.remove(sender);
+                }
+            }
+        });
+    }
+
+    // Spawn SIGHUP handler for config hot-reload
+    #[cfg(unix)]
+    {
+        let reload_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("Failed to register SIGHUP handler");
+            loop {
+                sig.recv().await;
+                info!("SIGHUP received, reloading config...");
+                let (added, removed) = reload_config(
+                    reload_state.config.config_path.as_deref(),
+                    &reload_state.config.account,
+                    &reload_state.allowed_ids,
+                );
+                info!("Config reloaded: +{added} -{removed} senders");
+            }
+        });
+    }
+
+    info!("ccchat starting for account {}", state.config.account);
     info!("Allowed list: {}", allowed_file_path().display());
     info!(
         "Allowed senders: {} (+ account owner)",
         persisted.allowed.len()
     );
-    info!("API: {}", state.api_url);
+    info!("API: {}", state.config.api_url);
+    if let Some((cap, rate)) = state.config.rate_limit_config {
+        info!("Rate limit: {cap} msgs burst, {rate:.4}/sec refill");
+    }
+    if let Some(ttl) = state.config.session_ttl {
+        info!("Session TTL: {}s", ttl.as_secs());
+    }
+    if state.config.debounce_ms > 0 {
+        info!("Debounce: {}ms", state.config.debounce_ms);
+    }
+
+    // Spawn stats HTTP server if configured
+    if args.stats_port > 0 {
+        let stats_listener =
+            tokio::net::TcpListener::bind(("127.0.0.1", args.stats_port))
+                .await
+                .expect("Failed to bind stats port");
+        let stats_state = state.clone();
+        tokio::spawn(stats::run_stats_server(stats_listener, stats_state));
+    }
 
     let mut backoff = 1u64;
     loop {
@@ -391,11 +450,145 @@ async fn main() {
 
 // --- WebSocket message loop ---
 
-async fn connect_and_listen(state: &Arc<State>) -> Result<(), BoxError> {
+/// Download and classify attachments, returning file paths and whether audio was found.
+async fn download_attachments(
+    state: &State,
+    reply_to: &str,
+    raw_attachments: &[signal::AttachmentInfo],
+) -> (Vec<std::path::PathBuf>, bool) {
+    let mut file_paths = Vec::new();
+    let mut has_audio = false;
+    for att in raw_attachments {
+        match classify_attachment(&att.content_type) {
+            AttachmentType::Image | AttachmentType::Document => {
+                match state.download_attachment(att).await {
+                    Ok(path) => file_paths.push(path),
+                    Err(e) => {
+                        error!("Failed to download attachment {}: {e}", att.id);
+                        let _ = state
+                            .send_message(reply_to, &format!("Failed to download attachment: {e}"))
+                            .await;
+                    }
+                }
+            }
+            AttachmentType::Audio => match state.download_attachment(att).await {
+                Ok(path) => {
+                    has_audio = true;
+                    file_paths.push(path);
+                }
+                Err(e) => {
+                    error!("Failed to download audio {}: {e}", att.id);
+                    let _ = state
+                        .send_message(reply_to, &format!("Failed to download voice message: {e}"))
+                        .await;
+                }
+            },
+            AttachmentType::Other => {
+                info!("Unsupported attachment type: {}", att.content_type);
+                let _ = state
+                    .send_message(
+                        reply_to,
+                        &format!("Unsupported attachment type: {}", att.content_type),
+                    )
+                    .await;
+            }
+        }
+    }
+    (file_paths, has_audio)
+}
+
+/// Handle an unauthorized sender: track as pending, notify admin.
+fn handle_unauthorized(state: &Arc<State>, source: &str, source_name: &str) {
+    let id = source.to_string();
+    let is_new = !state.pending_senders.contains_key(&id);
+    let short_id = if is_new {
+        let sid = state.pending_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        state.pending_senders.insert(
+            id.clone(),
+            PendingSender {
+                name: source_name.to_string(),
+                short_id: sid,
+            },
+        );
+        sid
+    } else {
+        state.pending_senders.get(&id).unwrap().short_id
+    };
+    info!(sender = %id, sender_name = %source_name, short_id = short_id, "Blocked unauthorized sender");
+
+    if is_new {
+        let notify = format!(
+            "New sender blocked: {source_name} ({id})\n\
+             Reply /allow {short_id}"
+        );
+        let state = Arc::clone(state);
+        let account = state.config.account.clone();
+        tokio::spawn(async move {
+            let _ = state.send_message(&account, &notify).await;
+        });
+    }
+}
+
+/// Buffer a message for debounce; spawn flush timer if needed.
+fn buffer_debounced(state: &Arc<State>, reply_to: &str, message_text: &str) {
+    {
+        let mut entry = state
+            .debounce
+            .buffers
+            .entry(reply_to.to_string())
+            .or_insert_with(|| (Vec::new(), Instant::now()));
+        entry.0.push(message_text.to_string());
+        entry.1 = Instant::now();
+    }
+    if state
+        .debounce
+        .active
+        .insert(reply_to.to_string(), ())
+        .is_none()
+    {
+        let state = Arc::clone(state);
+        let reply_to = reply_to.to_string();
+        let debounce_ms = state.config.debounce_ms;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(debounce_ms)).await;
+                let should_flush = state
+                    .debounce
+                    .buffers
+                    .get(&reply_to)
+                    .map(|e| e.1.elapsed() >= Duration::from_millis(debounce_ms))
+                    .unwrap_or(true);
+                if should_flush {
+                    break;
+                }
+            }
+            state.debounce.active.remove(&reply_to);
+            let messages = state
+                .debounce
+                .buffers
+                .remove(&reply_to)
+                .map(|(_, (msgs, _))| msgs)
+                .unwrap_or_default();
+            if messages.is_empty() {
+                return;
+            }
+            let merged = merge_messages(&messages);
+            info!(sender = %reply_to, count = messages.len(), "Debounced messages flushed");
+            if let Err(e) = handle_message(&state, &reply_to, &merged, &[]).await {
+                error!("Error handling message from {reply_to}: {e}");
+                let _ = state
+                    .send_message(&reply_to, &format!("Error: {e}"))
+                    .await;
+            }
+        });
+    }
+}
+
+async fn connect_and_listen(state: &Arc<State>) -> Result<(), AppError> {
     let ws_url = format!(
         "{}/v1/receive/{}",
-        state.api_url.replace("http", "ws"),
-        state.account
+        state.config.api_url.replace("http", "ws"),
+        state.config.account
     );
     info!("Connecting to {ws_url}");
 
@@ -421,391 +614,171 @@ async fn connect_and_listen(state: &Arc<State>) -> Result<(), BoxError> {
             }
         };
 
-        // Unwrap JSON-RPC wrapper: signal-cli daemon sends
-        // {"jsonrpc":"2.0","method":"receive","params":{"envelope":{...}}}
         let envelope = if parsed.get("params").is_some() {
             &parsed["params"]
         } else {
             &parsed
         };
 
-        // Extract sender: prefer sourceNumber (phone), fall back to source (UUID)
-        let source = envelope["envelope"]["sourceNumber"]
-            .as_str()
-            .or_else(|| envelope["envelope"]["source"].as_str());
-        let source = match source {
-            Some(s) if !s.is_empty() => s.to_string(),
-            _ => continue,
+        let parsed_env = match parse_envelope(envelope) {
+            Some(p) => p,
+            None => continue,
         };
 
-        // Extract message text from dataMessage or syncMessage (linked devices)
-        let (message_text, is_sync) = if let Some(m) =
-            envelope["envelope"]["dataMessage"]["message"].as_str()
-        {
-            if m.is_empty() {
-                continue;
-            }
-            (m.to_string(), false)
-        } else if let Some(m) =
-            envelope["envelope"]["syncMessage"]["sentMessage"]["message"].as_str()
-        {
-            if m.is_empty() {
-                continue;
-            }
-            (m.to_string(), true)
-        } else {
-            continue;
-        };
+        let ParsedEnvelope {
+            source,
+            message_text,
+            is_sync,
+            source_uuid,
+            source_name,
+            attachments: raw_attachments,
+        } = parsed_env;
 
         // Suppress Note to Self echoes
-        let msg_hash = hash_message(&message_text);
+        let msg_hash = helpers::hash_message(&message_text);
         if state.sent_hashes.remove(&msg_hash).is_some() {
             debug!("Suppressed echo: {}", truncate(&message_text, 40));
             continue;
         }
 
-        let source_uuid = envelope["envelope"]["sourceUuid"]
-            .as_str()
-            .unwrap_or_default();
-        let source_name = envelope["envelope"]["sourceName"]
-            .as_str()
-            .unwrap_or("unknown");
-
-        // Sync messages are always from the account owner (sent from a linked device)
-        if !is_sync && !state.is_allowed(&source) && !state.is_allowed(source_uuid) {
-            let id = if !source_uuid.is_empty() {
-                source_uuid.to_string()
-            } else {
-                source.clone()
-            };
-            let is_new = !state.pending_senders.contains_key(&id);
-            state
-                .pending_senders
-                .insert(id.clone(), source_name.to_string());
-            info!("Blocked message from {source_name} ({id})");
-
-            // Notify account owner via Note to Self (once per new sender)
-            if is_new {
-                let notify = format!(
-                    "New sender blocked: {source_name}\n\
-                     Reply to approve:\n\
-                     /allow {id}"
-                );
-                let state = Arc::clone(state);
-                let account = state.account.clone();
-                tokio::spawn(async move {
-                    let _ = send_message(&state, &account, &notify).await;
-                });
-            }
+        if !is_sync && !state.is_allowed(&source) && !state.is_allowed(&source_uuid) {
+            handle_unauthorized(state, &source, &source_name);
             continue;
         }
 
-        state.message_count.fetch_add(1, Ordering::Relaxed);
+        state.metrics.message_count.fetch_add(1, Ordering::Relaxed);
 
-        // For sync messages, reply to account (Note to Self), not to source UUID
         let reply_to = if is_sync {
-            state.account.clone()
+            state.config.account.clone()
         } else {
             source.clone()
         };
 
-        info!("Message from {source}: {message_text}");
-
-        let state = Arc::clone(state);
-        tokio::spawn(async move {
-            if let Err(e) = handle_message(&state, &reply_to, &message_text).await {
-                error!("Error handling message from {reply_to}: {e}");
-                let _ = send_message(&state, &reply_to, &format!("Error: {e}")).await;
-            }
-        });
-    }
-
-    Ok(())
-}
-
-// --- Message handling ---
-
-async fn handle_message(state: &State, sender: &str, text: &str) -> Result<(), BoxError> {
-    if let Some(response) = handle_command(state, sender, text) {
-        send_message(state, sender, &response).await?;
-        return Ok(());
-    }
-
-    let _ = set_typing(state, sender, true).await;
-
-    let (session_id, model, lock) = {
-        let entry = state.sessions.entry(sender.to_string()).or_insert_with(|| {
-            let session_id = uuid::Uuid::new_v4().to_string();
-            info!("New session for {sender}: {session_id}");
-            SenderState {
-                session_id,
-                model: state.model.clone(),
-                lock: Arc::new(Mutex::new(())),
-            }
-        });
-        (
-            entry.session_id.clone(),
-            entry.model.clone(),
-            entry.lock.clone(),
-        )
-    };
-
-    // Serialize claude calls per sender to avoid "session already in use" errors
-    let _guard = lock.lock().await;
-    let result = run_claude(state, text, &session_id, &model).await;
-
-    let _ = set_typing(state, sender, false).await;
-
-    match result {
-        Ok((response, cost)) => {
-            if let Some(c) = cost {
-                state.add_cost(c);
-                info!("Cost: ${c:.4} (total: ${:.4})", state.total_cost_usd());
-            }
-            info!("Reply to {sender}: {response}");
-            send_long_message(state, sender, &response).await?;
-        }
-        Err(e) => {
-            send_message(state, sender, &format!("Claude error: {e}")).await?;
-        }
-    }
-
-    Ok(())
-}
-
-fn handle_command(state: &State, sender: &str, text: &str) -> Option<String> {
-    let text = text.trim();
-
-    if text == "/reset" {
-        state.sessions.remove(sender);
-        return Some("Session reset. Next message starts a fresh conversation.".to_string());
-    }
-
-    if text == "/status" {
-        let uptime = state.start_time.elapsed();
-        let hours = uptime.as_secs() / 3600;
-        let mins = (uptime.as_secs() % 3600) / 60;
-        let count = state.message_count.load(Ordering::Relaxed);
-        let cost = state.total_cost_usd();
-        let sessions = state.sessions.len();
-        let allowed = state.allowed_ids.len();
-        return Some(format!(
-            "ccchat status\n\
-             Uptime: {hours}h {mins}m\n\
-             Messages: {count}\n\
-             Active sessions: {sessions}\n\
-             Allowed senders: {allowed}\n\
-             Total cost: ${cost:.4}"
-        ));
-    }
-
-    if text == "/pending" {
-        if state.pending_senders.is_empty() {
-            return Some("No pending senders.".to_string());
-        }
-        let mut lines = vec!["Blocked senders (reply /allow <id> to approve):".to_string()];
-        for entry in state.pending_senders.iter() {
-            lines.push(format!("  {} — /allow {}", entry.value(), entry.key()));
-        }
-        return Some(lines.join("\n"));
-    }
-
-    if let Some(id) = text.strip_prefix("/allow ") {
-        let id = id.trim().to_string();
-        if id.is_empty() {
-            return Some("Usage: /allow <id>".to_string());
-        }
-        let name = state
-            .pending_senders
-            .remove(&id)
-            .map(|(_, n)| n)
-            .unwrap_or_default();
-        state.allowed_ids.insert(id.clone(), ());
-        persist_allow(&id, &name);
-        info!("Approved: {id} ({name})");
-        let display = if name.is_empty() {
-            id.clone()
+        let has_attachments = !raw_attachments.is_empty();
+        if has_attachments {
+            info!(sender = %source, attachment_count = raw_attachments.len(), message_type = "attachment", "Incoming message");
         } else {
-            format!("{id} ({name})")
-        };
-        return Some(format!(
-            "Allowed: {display}\nSaved. They can now send messages."
-        ));
-    }
-
-    if text == "/allow" {
-        return Some(
-            "Usage: /allow <id>\n\
-             Permanently allows a sender.\n\
-             Use /pending to see blocked senders."
-                .to_string(),
-        );
-    }
-
-    if let Some(id) = text.strip_prefix("/revoke ") {
-        let id = id.trim().to_string();
-        if id.is_empty() {
-            return Some("Usage: /revoke <id>".to_string());
+            info!(sender = %source, message_type = "text", "Incoming message");
         }
-        state.allowed_ids.remove(&id);
-        persist_revoke(&id);
-        state.sessions.remove(&id);
-        info!("Revoked: {id}");
-        return Some(format!("Revoked: {id}"));
-    }
 
-    if let Some(model) = text.strip_prefix("/model ") {
-        let model = model.trim().to_string();
-        let mut entry = state
-            .sessions
-            .entry(sender.to_string())
-            .or_insert_with(|| SenderState {
-                session_id: uuid::Uuid::new_v4().to_string(),
-                model: model.clone(),
-                lock: Arc::new(Mutex::new(())),
+        if is_command(&message_text) || state.config.debounce_ms == 0 || has_attachments {
+            let state = Arc::clone(state);
+            tokio::spawn(async move {
+                let (file_paths, has_audio) =
+                    download_attachments(&state, &reply_to, &raw_attachments).await;
+                let final_text = if has_audio {
+                    voice_prompt(&message_text)
+                } else {
+                    message_text
+                };
+                if let Err(e) = handle_message(&state, &reply_to, &final_text, &file_paths).await
+                {
+                    error!("Error handling message from {reply_to}: {e}");
+                    let _ = state
+                        .send_message(&reply_to, &format!("Error: {e}"))
+                        .await;
+                }
             });
-        entry.model = model.clone();
-        return Some(format!("Model switched to: {model}"));
-    }
-
-    None
-}
-
-// --- Claude CLI ---
-
-async fn run_claude(
-    state: &State,
-    prompt: &str,
-    session_id: &str,
-    model: &str,
-) -> Result<(String, Option<f64>), BoxError> {
-    let output = Command::new("claude")
-        .arg("-p")
-        .arg(prompt)
-        .arg("--session-id")
-        .arg(session_id)
-        .arg("--output-format")
-        .arg("json")
-        .arg("--model")
-        .arg(model)
-        .arg("--max-budget-usd")
-        .arg(state.max_budget.to_string())
-        .env_remove("CLAUDE_CODE_ENTRYPOINT")
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("claude exited with {}: {stderr}", output.status).into());
-    }
-
-    let stdout = String::from_utf8(output.stdout)?;
-    let parsed: Value = serde_json::from_str(&stdout).unwrap_or_else(|_| {
-        serde_json::json!({"result": stdout.trim()})
-    });
-
-    let result = parsed["result"]
-        .as_str()
-        .unwrap_or_else(|| stdout.trim())
-        .to_string();
-
-    let cost = parsed["cost_usd"]
-        .as_f64()
-        .or_else(|| parsed["total_cost_usd"].as_f64());
-
-    Ok((result, cost))
-}
-
-// --- Signal messaging ---
-
-async fn set_typing(state: &State, recipient: &str, typing: bool) -> Result<(), BoxError> {
-    let url = format!(
-        "{}/v1/typing-indicator/{}",
-        state.api_url, state.account
-    );
-    let body = serde_json::json!({ "recipient": recipient });
-
-    let resp = if typing {
-        state.http.put(&url).json(&body).send().await?
-    } else {
-        state.http.delete(&url).json(&body).send().await?
-    };
-
-    if !resp.status().is_success() {
-        debug!("Typing indicator failed: {}", resp.status());
-    }
-    Ok(())
-}
-
-async fn send_message(state: &State, recipient: &str, message: &str) -> Result<(), BoxError> {
-    state.sent_hashes.insert(hash_message(message), ());
-
-    let url = format!("{}/v2/send", state.api_url);
-    let body = serde_json::json!({
-        "message": message,
-        "number": state.account,
-        "recipients": [recipient],
-    });
-
-    let resp = state.http.post(&url).json(&body).send().await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        error!("Send failed ({status}): {text}");
-        return Err(format!("Send failed: {status}").into());
-    }
-    Ok(())
-}
-
-async fn send_long_message(
-    state: &State,
-    recipient: &str,
-    message: &str,
-) -> Result<(), BoxError> {
-    let parts = split_message(message, 4000);
-    for (i, part) in parts.iter().enumerate() {
-        if i > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        } else {
+            buffer_debounced(state, &reply_to, &message_text);
         }
-        send_message(state, recipient, part).await?;
     }
+
     Ok(())
 }
 
-// --- Helpers ---
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn split_message(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
-        return vec![text.to_string()];
+    #[test]
+    fn test_no_memory_prompt_content() {
+        // The prompt must instruct Claude not to write to CLAUDE.md or memory files
+        assert!(NO_MEMORY_PROMPT.contains("CLAUDE.md"));
+        assert!(NO_MEMORY_PROMPT.contains("memory"));
+        assert!(NO_MEMORY_PROMPT.contains("multi-user"));
+        assert!(NO_MEMORY_PROMPT.contains("Do not write"));
     }
 
-    let mut parts = Vec::new();
-    let mut remaining = text;
+    // --- Args / --log-format parsing tests ---
 
-    while !remaining.is_empty() {
-        if remaining.len() <= max_len {
-            parts.push(remaining.to_string());
-            break;
-        }
-
-        let chunk = &remaining[..max_len];
-        let split_at = chunk
-            .rfind("\n\n")
-            .or_else(|| chunk.rfind('\n'))
-            .unwrap_or(max_len);
-
-        let (part, rest) = remaining.split_at(split_at);
-        parts.push(part.to_string());
-        remaining = rest.trim_start_matches('\n');
+    #[test]
+    fn test_log_format_defaults_to_text() {
+        let args =
+            Args::try_parse_from(["ccchat", "--account", "+1234567890"]).expect("parse failed");
+        assert_eq!(args.log_format, "text");
     }
 
-    parts
-}
+    #[test]
+    fn test_log_format_json_accepted() {
+        let args =
+            Args::try_parse_from(["ccchat", "--account", "+1234567890", "--log-format", "json"])
+                .expect("parse failed");
+        assert_eq!(args.log_format, "json");
+    }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
+    #[test]
+    fn test_log_format_text_explicit() {
+        let args =
+            Args::try_parse_from(["ccchat", "--account", "+1234567890", "--log-format", "text"])
+                .expect("parse failed");
+        assert_eq!(args.log_format, "text");
+    }
+
+    #[test]
+    fn test_log_format_arbitrary_value_accepted() {
+        // The field is a free-form String, so any value is accepted at the parse level.
+        // The match in main() treats anything other than "json" as text (the default branch).
+        let args = Args::try_parse_from([
+            "ccchat",
+            "--account",
+            "+1234567890",
+            "--log-format",
+            "yaml",
+        ])
+        .expect("parse failed");
+        assert_eq!(args.log_format, "yaml");
+    }
+
+    #[test]
+    fn test_args_account_required() {
+        // Parsing without --account should fail
+        let result = Args::try_parse_from(["ccchat"]);
+        assert!(result.is_err(), "expected error when --account is missing");
+    }
+
+    #[test]
+    fn test_args_default_values() {
+        let args =
+            Args::try_parse_from(["ccchat", "--account", "+1234567890"]).expect("parse failed");
+        assert_eq!(args.model, "opus");
+        assert!((args.max_budget - 5.0).abs() < f64::EPSILON);
+        assert_eq!(args.port, 8080);
+        assert_eq!(args.debounce_ms, 3000);
+        assert_eq!(args.log_format, "text");
+        assert!(args.api_url.is_none());
+        assert!(args.rate_limit.is_none());
+        assert!(args.session_ttl.is_none());
+        assert!(args.config.is_none());
+    }
+
+    #[test]
+    fn test_args_config_flag() {
+        let args = Args::try_parse_from([
+            "ccchat",
+            "--account",
+            "+1234567890",
+            "--config",
+            "/tmp/ccchat.json",
+        ])
+        .expect("parse failed");
+        assert_eq!(args.config, Some("/tmp/ccchat.json".to_string()));
+    }
+
+    #[test]
+    fn test_args_config_defaults_to_none() {
+        let args =
+            Args::try_parse_from(["ccchat", "--account", "+1234567890"]).expect("parse failed");
+        assert!(args.config.is_none());
     }
 }
