@@ -5,14 +5,33 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
+pub(crate) fn build_health_json(state: &State) -> serde_json::Value {
+    serde_json::json!({
+        "status": "ok",
+        "uptime_secs": state.metrics.start_time.elapsed().as_secs(),
+        "version": env!("CARGO_PKG_VERSION"),
+    })
+}
+
 pub(crate) fn build_stats_json(state: &State) -> serde_json::Value {
     let uptime = state.metrics.start_time.elapsed();
+    let sender_costs: serde_json::Map<String, serde_json::Value> = state
+        .sender_costs
+        .iter()
+        .map(|e| {
+            let cost = e.value().load(Ordering::Relaxed) as f64 / 1_000_000.0;
+            (e.key().clone(), serde_json::json!(cost))
+        })
+        .collect();
     serde_json::json!({
         "uptime_secs": uptime.as_secs(),
         "messages": state.metrics.message_count.load(Ordering::Relaxed),
         "active_sessions": state.session_mgr.sessions.len(),
         "allowed_senders": state.allowed_ids.len(),
         "total_cost_usd": state.total_cost_usd(),
+        "error_count": state.metrics.error_count.load(Ordering::Relaxed),
+        "avg_latency_ms": state.avg_latency_ms(),
+        "sender_costs": sender_costs,
         "model": state.config.model,
         "version": env!("CARGO_PKG_VERSION"),
     })
@@ -33,7 +52,13 @@ pub(crate) async fn run_stats_server(listener: TcpListener, state: Arc<State>) {
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-            let body = build_stats_json(&state).to_string();
+            let request = String::from_utf8_lossy(&buf);
+            let path = request.split_whitespace().nth(1).unwrap_or("/");
+            let body = if path == "/healthz" {
+                build_health_json(&state).to_string()
+            } else {
+                build_stats_json(&state).to_string()
+            };
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -49,6 +74,30 @@ mod tests {
     use super::*;
     use crate::state::tests::test_state_with;
     use crate::traits::{MockClaudeRunner, MockSignalApi};
+
+    #[test]
+    fn test_build_health_json_has_status_ok() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let json = build_health_json(&state);
+        assert_eq!(json["status"], "ok");
+    }
+
+    #[test]
+    fn test_build_health_json_has_uptime() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let json = build_health_json(&state);
+        assert!(json.get("uptime_secs").is_some());
+        assert!(json["uptime_secs"].is_u64());
+    }
+
+    #[test]
+    fn test_build_health_json_has_version() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let json = build_health_json(&state);
+        assert!(json.get("version").is_some());
+        assert!(json["version"].is_string());
+        assert!(!json["version"].as_str().unwrap().is_empty());
+    }
 
     #[test]
     fn test_build_stats_json_initially_zero() {
@@ -105,6 +154,26 @@ mod tests {
 
         // Model reflects the test state
         assert_eq!(json["model"], "sonnet");
+    }
+
+    #[test]
+    fn test_stats_includes_error_count() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        state.metrics.error_count.fetch_add(3, Ordering::Relaxed);
+        let json = build_stats_json(&state);
+        assert_eq!(json["error_count"], 3);
+    }
+
+    #[test]
+    fn test_stats_includes_per_sender_costs() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        state.add_sender_cost("+alice", 0.05);
+        state.add_sender_cost("+bob", 0.10);
+        let json = build_stats_json(&state);
+        let costs = json["sender_costs"].as_object().unwrap();
+        assert_eq!(costs.len(), 2);
+        assert!((costs["+alice"].as_f64().unwrap() - 0.05).abs() < 0.001);
+        assert!((costs["+bob"].as_f64().unwrap() - 0.10).abs() < 0.001);
     }
 
     #[test]
@@ -190,5 +259,39 @@ mod tests {
         assert!((json["total_cost_usd"].as_f64().unwrap() - 0.42).abs() < 0.001);
         assert_eq!(json["model"], "sonnet");
         assert!(json["version"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_responds() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let state = Arc::new(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_state = state.clone();
+        tokio::spawn(run_stats_server(listener, server_state));
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+            .await
+            .unwrap();
+        let response_str = String::from_utf8(response).unwrap();
+
+        assert!(response_str.starts_with("HTTP/1.1 200 OK"));
+        let body = response_str.split("\r\n\r\n").nth(1).unwrap();
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json.get("uptime_secs").is_some());
+        assert!(json.get("version").is_some());
+        // Should NOT contain full stats fields
+        assert!(json.get("messages").is_none());
     }
 }
