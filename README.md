@@ -80,14 +80,40 @@ Type these in your chat to control ccchat:
 
 | Command | What it Does |
 |---------|-------------|
+| `/help` | Show all available commands |
+| `/status` | Show uptime, messages, cost, latency |
+| `/reset` | Start a fresh conversation (saves memory) |
+| `/more` | Continue a truncated response |
+| `/model <name>` | Switch Claude model (opus, sonnet, haiku) |
+| `/memory` | Show stored conversation memory |
+| `/forget` | Clear all stored memory |
+| `/search <query>` | Search conversation history |
+| `/export` | Export conversation history |
+| `/usage` | Show your personal usage stats |
+| **Pins** | |
+| `/pin <label>` | Pin recent messages with a label |
+| `/pins` | List saved pins |
+| `/recall <label>` | Recall a pinned conversation for context |
+| **Reminders** | |
+| `/remind <time> <msg>` | Set a one-shot reminder (e.g., `/remind 5m Check oven`) |
+| `/reminders` | List your pending reminders |
+| `/cancel <id>` | Cancel a reminder |
+| **Cron Jobs** | |
+| `/cron <pattern> <msg>` | Create a cron job (e.g., `/cron "0 9 * * MON" Standup`) |
+| `/every <interval> <msg>` | Repeat every N time (e.g., `/every 1h Check status`) |
+| `/daily <HH:MM> <msg>` | Daily job at time UTC (e.g., `/daily 09:00 Standup`) |
+| `/crons` | List active cron jobs |
+| `/cron-cancel <id>` | Cancel a cron job |
+| `/cron-pause <id>` | Pause a cron job |
+| `/cron-resume <id>` | Resume a paused cron job |
+| **Admin** | |
 | `/allow <id>` | Permanently approve a sender |
 | `/revoke <id>` | Remove a sender's access |
 | `/pending` | Show blocked senders waiting for approval |
-| `/status` | Show uptime, message count, active sessions, and total cost |
-| `/model sonnet` | Switch to a different Claude model (opus, sonnet, haiku) |
-| `/reset` | Start a fresh conversation (clears memory) |
+| `/audit` | View recent admin actions |
+| `/export-config` | Export allowed senders as JSON |
 
-Everything else you type gets sent to Claude.
+Everything else you type gets sent to Claude. All cron/reminder times are in UTC.
 
 ## Options
 
