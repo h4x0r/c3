@@ -5,10 +5,12 @@ mod error;
 mod helpers;
 mod memory;
 mod queue;
+mod schedule;
 mod signal;
 mod state;
 mod stats;
 mod traits;
+mod webhook;
 
 use clap::Parser;
 use dashmap::DashMap;
@@ -82,6 +84,10 @@ struct Args {
     /// Port for stats HTTP endpoint (0 = disabled)
     #[arg(long, default_value_t = 0, env = "CCCHAT_STATS_PORT")]
     stats_port: u16,
+
+    /// Webhook URL for event notifications (POST JSON)
+    #[arg(long, env = "CCCHAT_WEBHOOK_URL")]
+    webhook_url: Option<String>,
 }
 
 // --- signal-cli-api lifecycle ---
@@ -330,6 +336,7 @@ async fn main() {
             api_url,
             config_path: args.config,
             system_prompt: None,
+            webhook_url: args.webhook_url,
         },
         metrics: state::Metrics {
             start_time: Instant::now(),
@@ -354,6 +361,7 @@ async fn main() {
         rate_limits: DashMap::new(),
         sender_costs: DashMap::new(),
         sender_prompts: DashMap::new(),
+        pending_recalls: DashMap::new(),
         runtime_system_prompt: std::sync::RwLock::new(None),
         signal_api,
         claude_runner: Box::new(ClaudeRunnerImpl),
@@ -425,6 +433,7 @@ async fn main() {
                 .await
                 .expect("Failed to listen for ctrl-c");
             audit::log_action("shutdown", "", "graceful");
+            webhook::fire_if_configured(&shutdown_state.config.webhook_url, "shutdown", "", "graceful");
             info!("Shutdown signal received, saving active sessions...");
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
@@ -485,6 +494,28 @@ async fn main() {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 commands::retry_pending_messages(&retry_state).await;
+            }
+        });
+    }
+
+    // Spawn reminder delivery loop (every 30s)
+    {
+        let reminder_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                commands::deliver_due_reminders(&reminder_state).await;
+            }
+        });
+    }
+
+    // Spawn cron job delivery loop (every 30s)
+    {
+        let cron_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                commands::deliver_due_cron_jobs(&cron_state).await;
             }
         });
     }
@@ -580,6 +611,7 @@ async fn connect_and_listen(state: &Arc<State>) -> Result<(), AppError> {
         }
 
         state.metrics.message_count.fetch_add(1, Ordering::Relaxed);
+        webhook::fire_if_configured(&state.config.webhook_url, "message_received", &source, "");
 
         let reply_to = if is_sync {
             state.config.account.clone()

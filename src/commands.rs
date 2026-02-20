@@ -1014,6 +1014,20 @@ pub(crate) async fn deliver_due_reminders(state: &State) {
     crate::schedule::purge_delivered(&conn);
 }
 
+pub(crate) async fn deliver_due_cron_jobs(state: &State) {
+    let Ok(conn) = crate::schedule::open_schedule_db() else {
+        return;
+    };
+    for (id, sender, message, cron_pattern, interval_secs) in crate::schedule::get_due_cron_jobs(&conn) {
+        let text = format!("Scheduled: {message}");
+        if let Err(e) = state.send_message(&sender, &text).await {
+            warn!(sender = %sender, "Failed to deliver cron job: {e}");
+        } else {
+            crate::schedule::advance_cron_job(&conn, id, cron_pattern.as_deref(), interval_secs);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2602,5 +2616,69 @@ mod tests {
         assert!(result.contains("/every"), "help should mention /every: {result}");
         assert!(result.contains("/daily"), "help should mention /daily: {result}");
         assert!(result.contains("/crons"), "help should mention /crons: {result}");
+    }
+
+    // --- deliver_due_cron_jobs tests ---
+
+    #[tokio::test]
+    async fn test_deliver_due_cron_jobs_sends_message() {
+        let mut signal = MockSignalApi::new();
+        let send_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let count_clone = Arc::clone(&send_count);
+        signal.expect_send_msg().returning(move |_, msg| {
+            assert!(msg.contains("Scheduled:"), "should prefix with Scheduled:");
+            count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        let state = test_state_with(signal, MockClaudeRunner::new());
+        // Insert a due job directly
+        let conn = crate::schedule::open_schedule_db().unwrap();
+        let now = crate::helpers::epoch_now();
+        conn.execute(
+            "INSERT INTO cron_jobs (sender, message, job_type, interval_secs, next_delivery_at, status, created_at) VALUES (?1, ?2, 'interval', 60, ?3, 'active', ?4)",
+            rusqlite::params!["+allowed_user", "test delivery", now - 10, now],
+        ).unwrap();
+        deliver_due_cron_jobs(&state).await;
+        assert!(send_count.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_deliver_due_cron_jobs_advances_after_delivery() {
+        let mut signal = MockSignalApi::new();
+        signal.expect_send_msg().returning(|_, _| Ok(()));
+        let state = test_state_with(signal, MockClaudeRunner::new());
+        let conn = crate::schedule::open_schedule_db().unwrap();
+        let now = crate::helpers::epoch_now();
+        conn.execute(
+            "INSERT INTO cron_jobs (sender, message, job_type, interval_secs, next_delivery_at, status, created_at) VALUES (?1, ?2, 'interval', 3600, ?3, 'active', ?4)",
+            rusqlite::params!["+allowed_user", "advance test", now - 10, now],
+        ).unwrap();
+        let id = conn.last_insert_rowid();
+        deliver_due_cron_jobs(&state).await;
+        let next: i64 = conn.query_row(
+            "SELECT next_delivery_at FROM cron_jobs WHERE id = ?1",
+            rusqlite::params![id], |row| row.get(0),
+        ).unwrap();
+        assert!(next > now, "next_delivery_at should advance after delivery");
+    }
+
+    #[tokio::test]
+    async fn test_deliver_due_cron_jobs_skips_on_send_failure() {
+        let mut signal = MockSignalApi::new();
+        signal.expect_send_msg().returning(|_, _| Err("send failed".into()));
+        let state = test_state_with(signal, MockClaudeRunner::new());
+        let conn = crate::schedule::open_schedule_db().unwrap();
+        let now = crate::helpers::epoch_now();
+        conn.execute(
+            "INSERT INTO cron_jobs (sender, message, job_type, interval_secs, next_delivery_at, status, created_at) VALUES (?1, ?2, 'interval', 60, ?3, 'active', ?4)",
+            rusqlite::params!["+allowed_user", "fail test", now - 10, now],
+        ).unwrap();
+        let id = conn.last_insert_rowid();
+        deliver_due_cron_jobs(&state).await;
+        let next: i64 = conn.query_row(
+            "SELECT next_delivery_at FROM cron_jobs WHERE id = ?1",
+            rusqlite::params![id], |row| row.get(0),
+        ).unwrap();
+        assert!(next <= now, "should NOT advance on send failure");
     }
 }
