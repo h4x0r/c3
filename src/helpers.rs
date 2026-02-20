@@ -137,6 +137,21 @@ pub(crate) fn find_free_port(preferred: u16) -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// Map file extension to MIME content type for attachment sending.
+pub(crate) fn content_type_from_extension(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("pdf") => "application/pdf",
+        Some("txt" | "md" | "rs" | "py" | "js") => "text/plain",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Extract file paths from text that point to existing files under /tmp/ccchat/.
 pub(crate) fn extract_file_references(text: &str) -> Vec<PathBuf> {
     let prefix = "/tmp/ccchat/";
@@ -408,6 +423,19 @@ mod tests {
     fn test_looks_truncated_ends_with_backtick() {
         let response = format!("{}`", "a".repeat(3600));
         assert!(!looks_truncated(&response));
+    }
+
+    #[test]
+    fn test_content_type_from_extension_png() {
+        assert_eq!(content_type_from_extension(std::path::Path::new("image.png")), "image/png");
+        assert_eq!(content_type_from_extension(std::path::Path::new("photo.jpg")), "image/jpeg");
+        assert_eq!(content_type_from_extension(std::path::Path::new("doc.pdf")), "application/pdf");
+    }
+
+    #[test]
+    fn test_content_type_from_extension_unknown() {
+        assert_eq!(content_type_from_extension(std::path::Path::new("file.xyz")), "application/octet-stream");
+        assert_eq!(content_type_from_extension(std::path::Path::new("noext")), "application/octet-stream");
     }
 
     #[test]

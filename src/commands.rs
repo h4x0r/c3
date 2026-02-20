@@ -471,6 +471,20 @@ async fn send_claude_response(
                 state.session_mgr.truncated_sessions.remove(sender);
                 state.send_long_message(sender, &response).await?;
             }
+            // Send any file references as attachments
+            let file_refs = crate::helpers::extract_file_references(&response);
+            for file_path in &file_refs {
+                match std::fs::read(file_path) {
+                    Ok(data) => {
+                        let ct = crate::helpers::content_type_from_extension(file_path);
+                        let fname = file_path.file_name().unwrap_or_default().to_string_lossy();
+                        if let Err(e) = state.signal_api.send_attachment(sender, &data, ct, &fname).await {
+                            warn!(sender = %sender, file = %file_path.display(), "Attachment send failed: {e}");
+                        }
+                    }
+                    Err(e) => warn!(sender = %sender, file = %file_path.display(), "Failed to read file: {e}"),
+                }
+            }
             Ok(())
         }
         Err(e) => {
@@ -1262,6 +1276,39 @@ mod tests {
         for line in text.lines().skip(1) {
             assert!(line.contains(" - "), "Missing description separator in: {line}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_send_claude_response_sends_attachments() {
+        use std::path::PathBuf;
+
+        // Create a temp file that Claude's response will reference
+        let dir = PathBuf::from("/tmp/ccchat");
+        let _ = std::fs::create_dir_all(&dir);
+        let test_file = dir.join(format!("attach_test_{}.png", std::process::id()));
+        std::fs::write(&test_file, b"fake png data").unwrap();
+
+        let mut signal = MockSignalApi::new();
+        signal.expect_set_typing().returning(|_, _| Ok(()));
+        signal.expect_send_msg().returning(|_, _| Ok(()));
+        signal
+            .expect_send_attachment()
+            .withf(|_, data, ct, fname| {
+                data == b"fake png data" && ct == "image/png" && fname.contains("attach_test_")
+            })
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+
+        let response_text = format!("Here is your file: {}", test_file.display());
+        let response_clone = response_text.clone();
+        let mut claude = MockClaudeRunner::new();
+        claude
+            .expect_run_claude()
+            .returning(move |_, _, _, _, _, _, _| Ok((response_clone.clone(), Some(0.01))));
+
+        let state = test_state_with(signal, claude);
+        let _ = handle_message(&state, "+allowed_user", "make a png", &[]).await;
+        let _ = std::fs::remove_file(&test_file);
     }
 
     #[tokio::test]

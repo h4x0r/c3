@@ -1,7 +1,6 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-#[allow(dead_code)] // variants used incrementally as BoxError call sites are migrated
 pub(crate) enum AppError {
     #[error("Signal API error: {0}")]
     Signal(String),
