@@ -117,6 +117,24 @@ pub(crate) fn load_model_preference(conn: &Connection) -> Option<String> {
     .ok()
 }
 
+pub(crate) fn get_message_count_by_role(conn: &Connection) -> (i64, i64) {
+    let user: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE role = 'user'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let assistant: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE role = 'assistant'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    (user, assistant)
+}
+
 pub(crate) fn export_messages(conn: &Connection, limit: usize) -> String {
     let sql = "SELECT role, content, timestamp FROM messages ORDER BY timestamp DESC LIMIT ?1";
     let Ok(mut stmt) = conn.prepare(sql) else {
@@ -147,6 +165,62 @@ pub(crate) fn export_messages(conn: &Connection, limit: usize) -> String {
         lines.push(format!("[{date}] {role}: {truncated}"));
     }
     lines.join("\n")
+}
+
+pub(crate) fn save_pin(conn: &Connection, label: &str, content: &str) {
+    let timestamp = crate::helpers::epoch_now();
+    if let Err(e) = conn.execute(
+        "INSERT INTO pins (label, content, timestamp) VALUES (?1, ?2, ?3)
+         ON CONFLICT(label) DO UPDATE SET content = excluded.content, timestamp = excluded.timestamp",
+        rusqlite::params![label, content, timestamp],
+    ) {
+        error!("Failed to save pin: {e}");
+    }
+}
+
+pub(crate) fn list_pins(conn: &Connection) -> Vec<(String, i64)> {
+    let sql = "SELECT label, timestamp FROM pins ORDER BY timestamp DESC";
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return Vec::new();
+    };
+    stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })
+    .ok()
+    .map(|iter| iter.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+pub(crate) fn get_pin(conn: &Connection, label: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT content FROM pins WHERE label = ?1",
+        rusqlite::params![label],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+pub(crate) fn delete_pin(conn: &Connection, label: &str) {
+    let _ = conn.execute(
+        "DELETE FROM pins WHERE label = ?1",
+        rusqlite::params![label],
+    );
+}
+
+pub(crate) fn get_recent_messages(conn: &Connection, limit: usize) -> Vec<(String, String, i64)> {
+    let sql = "SELECT role, content, timestamp FROM messages ORDER BY timestamp DESC, id DESC LIMIT ?1";
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(String, String, i64)> = stmt
+        .query_map(rusqlite::params![limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .ok()
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    rows.reverse(); // chronological order
+    rows
 }
 
 pub(crate) fn purge_old_messages(conn: &Connection, days: u32) {

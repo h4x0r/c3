@@ -37,6 +37,35 @@ pub(crate) fn build_stats_json(state: &State) -> serde_json::Value {
     })
 }
 
+pub(crate) fn build_prometheus_metrics(state: &State) -> String {
+    let uptime = state.metrics.start_time.elapsed().as_secs();
+    let messages = state.metrics.message_count.load(Ordering::Relaxed);
+    let errors = state.metrics.error_count.load(Ordering::Relaxed);
+    let cost = state.total_cost_usd();
+    let sessions = state.session_mgr.sessions.len();
+    let latency = state.avg_latency_ms();
+    format!(
+        "# HELP ccchat_uptime_seconds Bot uptime in seconds\n\
+         # TYPE ccchat_uptime_seconds gauge\n\
+         ccchat_uptime_seconds {uptime}\n\
+         # HELP ccchat_messages_total Total messages processed\n\
+         # TYPE ccchat_messages_total counter\n\
+         ccchat_messages_total {messages}\n\
+         # HELP ccchat_errors_total Total errors\n\
+         # TYPE ccchat_errors_total counter\n\
+         ccchat_errors_total {errors}\n\
+         # HELP ccchat_cost_usd_total Total cost in USD\n\
+         # TYPE ccchat_cost_usd_total gauge\n\
+         ccchat_cost_usd_total {cost}\n\
+         # HELP ccchat_active_sessions Current active sessions\n\
+         # TYPE ccchat_active_sessions gauge\n\
+         ccchat_active_sessions {sessions}\n\
+         # HELP ccchat_avg_latency_ms Average response latency\n\
+         # TYPE ccchat_avg_latency_ms gauge\n\
+         ccchat_avg_latency_ms {latency}\n"
+    )
+}
+
 pub(crate) async fn run_stats_server(listener: TcpListener, state: Arc<State>) {
     info!(addr = %listener.local_addr().unwrap(), "Stats server listening");
     loop {
@@ -54,13 +83,15 @@ pub(crate) async fn run_stats_server(listener: TcpListener, state: Arc<State>) {
             let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
             let request = String::from_utf8_lossy(&buf);
             let path = request.split_whitespace().nth(1).unwrap_or("/");
-            let body = if path == "/healthz" {
-                build_health_json(&state).to_string()
+            let (body, content_type) = if path == "/healthz" {
+                (build_health_json(&state).to_string(), "application/json")
+            } else if path == "/metrics" {
+                (build_prometheus_metrics(&state), "text/plain; version=0.0.4; charset=utf-8")
             } else {
-                build_stats_json(&state).to_string()
+                (build_stats_json(&state).to_string(), "application/json")
             };
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -204,6 +235,7 @@ mod tests {
                 model: "sonnet".to_string(),
                 lock: Arc::new(tokio::sync::Mutex::new(())),
                 last_activity: std::time::Instant::now(),
+                message_count: 0,
             },
         );
         let json = build_stats_json(&state);
@@ -259,6 +291,85 @@ mod tests {
         assert!((json["total_cost_usd"].as_f64().unwrap() - 0.42).abs() < 0.001);
         assert_eq!(json["model"], "sonnet");
         assert!(json["version"].is_string());
+    }
+
+    // --- Prometheus metrics tests ---
+
+    #[test]
+    fn test_prometheus_metrics_has_uptime() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let metrics = build_prometheus_metrics(&state);
+        assert!(metrics.contains("ccchat_uptime_seconds"), "got: {metrics}");
+    }
+
+    #[test]
+    fn test_prometheus_metrics_has_messages() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        state.metrics.message_count.store(42, Ordering::Relaxed);
+        let metrics = build_prometheus_metrics(&state);
+        assert!(metrics.contains("ccchat_messages_total 42"), "got: {metrics}");
+    }
+
+    #[test]
+    fn test_prometheus_metrics_has_errors() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        state.metrics.error_count.store(3, Ordering::Relaxed);
+        let metrics = build_prometheus_metrics(&state);
+        assert!(metrics.contains("ccchat_errors_total 3"), "got: {metrics}");
+    }
+
+    #[test]
+    fn test_prometheus_metrics_has_cost() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        state.add_cost(1.2345);
+        let metrics = build_prometheus_metrics(&state);
+        assert!(metrics.contains("ccchat_cost_usd_total"), "got: {metrics}");
+    }
+
+    #[test]
+    fn test_prometheus_metrics_has_sessions() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let metrics = build_prometheus_metrics(&state);
+        assert!(metrics.contains("ccchat_active_sessions 0"), "got: {metrics}");
+    }
+
+    #[test]
+    fn test_prometheus_metrics_has_type_annotations() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let metrics = build_prometheus_metrics(&state);
+        assert!(metrics.contains("# TYPE"), "missing # TYPE, got: {metrics}");
+        assert!(metrics.contains("# HELP"), "missing # HELP, got: {metrics}");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_responds() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let state = Arc::new(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_state = state.clone();
+        tokio::spawn(run_stats_server(listener, server_state));
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+            .await
+            .unwrap();
+        let response_str = String::from_utf8(response).unwrap();
+
+        assert!(response_str.starts_with("HTTP/1.1 200 OK"));
+        assert!(response_str.contains("text/plain"));
+        let body = response_str.split("\r\n\r\n").nth(1).unwrap();
+        assert!(body.contains("ccchat_uptime_seconds"));
+        assert!(body.contains("ccchat_messages_total"));
     }
 
     #[tokio::test]

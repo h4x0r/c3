@@ -57,6 +57,12 @@ pub(crate) fn open_memory_db(sender: &str) -> Result<Connection, AppError> {
             id INTEGER PRIMARY KEY CHECK (id = 1),
             model TEXT NOT NULL,
             updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS pins (
+            id INTEGER PRIMARY KEY,
+            label TEXT NOT NULL UNIQUE,
+            content TEXT NOT NULL,
+            timestamp INTEGER NOT NULL
         );",
     )?;
     migrate_json_to_sqlite(&conn, sender);

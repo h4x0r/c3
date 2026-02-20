@@ -20,6 +20,7 @@ pub(crate) struct SenderState {
     pub(crate) model: String,
     pub(crate) lock: Arc<Mutex<()>>,
     pub(crate) last_activity: Instant,
+    pub(crate) message_count: u64,
 }
 
 pub(crate) struct TokenBucket {
@@ -64,6 +65,7 @@ pub(crate) struct Config {
     pub(crate) api_url: String,
     pub(crate) config_path: Option<String>,
     pub(crate) system_prompt: Option<String>,
+    pub(crate) webhook_url: Option<String>,
 }
 
 /// Runtime metrics (atomic counters).
@@ -100,6 +102,7 @@ pub(crate) struct State {
     pub(crate) rate_limits: DashMap<String, TokenBucket>,
     pub(crate) sender_costs: DashMap<String, AtomicU64>,
     pub(crate) sender_prompts: DashMap<String, String>,
+    pub(crate) pending_recalls: DashMap<String, String>,
     pub(crate) runtime_system_prompt: RwLock<Option<String>>,
     pub(crate) signal_api: Box<dyn SignalApi>,
     pub(crate) claude_runner: Box<dyn ClaudeRunner>,
@@ -235,6 +238,7 @@ impl State {
                     model,
                     lock: Arc::new(Mutex::new(())),
                     last_activity: Instant::now(),
+                    message_count: 0,
                 }
             });
         entry.last_activity = Instant::now();
@@ -264,6 +268,7 @@ pub(crate) mod tests {
                 api_url: "http://127.0.0.1:9999".to_string(),
                 config_path: None,
                 system_prompt: None,
+                webhook_url: None,
             },
             metrics: Metrics {
                 start_time: Instant::now(),
@@ -293,6 +298,7 @@ pub(crate) mod tests {
             rate_limits: DashMap::new(),
             sender_costs: DashMap::new(),
             sender_prompts: DashMap::new(),
+            pending_recalls: DashMap::new(),
             runtime_system_prompt: RwLock::new(None),
             signal_api: Box::new(signal),
             claude_runner: Box::new(claude),
@@ -501,6 +507,7 @@ pub(crate) mod tests {
                 model: "sonnet".to_string(),
                 lock: Arc::new(Mutex::new(())),
                 last_activity: Instant::now(),
+                message_count: 0,
             },
         );
         state.session_mgr.sessions.insert(
@@ -510,6 +517,7 @@ pub(crate) mod tests {
                 model: "sonnet".to_string(),
                 lock: Arc::new(Mutex::new(())),
                 last_activity: Instant::now(),
+                message_count: 0,
             },
         );
 
@@ -543,6 +551,7 @@ pub(crate) mod tests {
                 model: "sonnet".to_string(),
                 lock: Arc::new(Mutex::new(())),
                 last_activity: Instant::now(),
+                message_count: 0,
             },
         );
 

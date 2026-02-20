@@ -30,3 +30,9 @@ pub(crate) const MAX_SUMMARIES: usize = 5;
 
 /// Number of seconds in a day.
 pub(crate) const SECS_PER_DAY: i64 = 86400;
+
+/// Number of recent messages to capture when pinning.
+pub(crate) const PIN_MESSAGE_COUNT: usize = 10;
+
+/// Number of message pairs before triggering auto-summarization.
+pub(crate) const AUTO_SUMMARIZE_THRESHOLD: u64 = 20;

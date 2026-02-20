@@ -81,7 +81,7 @@ ccchat is free. You pay for Claude AI usage via your Anthropic account — typic
 
 ## Learn More
 
-→ **[User Manual](USER_MANUAL.md)** — full setup guide, every command explained, troubleshooting
+→ **[User Manual](docs/user-guide.md)** — full setup guide, every command explained, troubleshooting
 
 ---
 
