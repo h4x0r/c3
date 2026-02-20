@@ -798,6 +798,15 @@ pub(crate) async fn handle_message(
         return Ok(());
     }
 
+    // ── Prompt injection guard ─────────────────────────────────────────
+    if let Some(ref lakera_key) = state.config.lakera_api_key {
+        let (decision, msg) = crate::guard::run_guard(text, lakera_key, &state.http).await;
+        if decision == crate::guard::GuardDecision::Block {
+            state.send_message(sender, msg).await?;
+            return Ok(());
+        }
+    }
+
     let _ = state.set_typing(sender, true).await;
     let (session_id, model, lock, is_new_session) = state.get_or_create_session(sender);
 

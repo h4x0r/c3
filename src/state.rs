@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use reqwest::Client;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -66,6 +67,8 @@ pub(crate) struct Config {
     pub(crate) config_path: Option<String>,
     pub(crate) system_prompt: Option<String>,
     pub(crate) webhook_url: Option<String>,
+    /// Lakera Guard API key for prompt injection detection (None = guard disabled)
+    pub(crate) lakera_api_key: Option<String>,
 }
 
 /// Runtime metrics (atomic counters).
@@ -104,6 +107,7 @@ pub(crate) struct State {
     pub(crate) sender_prompts: DashMap<String, String>,
     pub(crate) pending_recalls: DashMap<String, String>,
     pub(crate) runtime_system_prompt: RwLock<Option<String>>,
+    pub(crate) http: Client,
     pub(crate) signal_api: Box<dyn SignalApi>,
     pub(crate) claude_runner: Box<dyn ClaudeRunner>,
 }
@@ -269,6 +273,7 @@ pub(crate) mod tests {
                 config_path: None,
                 system_prompt: None,
                 webhook_url: None,
+                lakera_api_key: None,
             },
             metrics: Metrics {
                 start_time: Instant::now(),
@@ -300,6 +305,7 @@ pub(crate) mod tests {
             sender_prompts: DashMap::new(),
             pending_recalls: DashMap::new(),
             runtime_system_prompt: RwLock::new(None),
+            http: Client::new(),
             signal_api: Box::new(signal),
             claude_runner: Box::new(claude),
         }

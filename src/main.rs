@@ -1,6 +1,7 @@
 mod audit;
 mod commands;
 mod constants;
+mod guard;
 mod error;
 mod helpers;
 mod memory;
@@ -88,6 +89,7 @@ struct Args {
     /// Webhook URL for event notifications (POST JSON)
     #[arg(long, env = "CCCHAT_WEBHOOK_URL")]
     webhook_url: Option<String>,
+
 }
 
 // --- signal-cli-api lifecycle ---
@@ -319,6 +321,7 @@ async fn main() {
     });
 
     let sent_hashes = Arc::new(DashMap::new());
+    let guard_http = http.clone();
     let signal_api = Box::new(SignalApiImpl {
         http,
         api_url: api_url.clone(),
@@ -337,6 +340,7 @@ async fn main() {
             config_path: args.config,
             system_prompt: None,
             webhook_url: args.webhook_url,
+            lakera_api_key: std::env::var("LAKERA_GUARD_API_KEY").ok(),
         },
         metrics: state::Metrics {
             start_time: Instant::now(),
@@ -363,6 +367,7 @@ async fn main() {
         sender_prompts: DashMap::new(),
         pending_recalls: DashMap::new(),
         runtime_system_prompt: std::sync::RwLock::new(None),
+        http: guard_http,
         signal_api,
         claude_runner: Box::new(ClaudeRunnerImpl),
     });
