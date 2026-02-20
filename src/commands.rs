@@ -119,6 +119,7 @@ fn cmd_model(state: &State, sender: &str, model: &str) -> String {
             model: model.clone(),
             lock: Arc::new(Mutex::new(())),
             last_activity: Instant::now(),
+            message_count: 0,
         });
     entry.model = model.clone();
     // Persist preference so it survives session resets
@@ -286,6 +287,28 @@ pub(crate) fn buffer_debounced(state: &Arc<State>, reply_to: &str, message_text:
     }
 }
 
+fn cmd_usage(state: &State, sender: &str) -> String {
+    let cost = state.sender_cost_usd(sender);
+    let (_, model, _, _) = state.get_or_create_session(sender);
+    let (sent, received, first_date) = match crate::memory::open_memory_db(sender) {
+        Ok(conn) => {
+            let (u, a) = crate::memory::get_message_count_by_role(&conn);
+            let first = crate::memory::messages::get_oldest_message_ts(&conn)
+                .map(|ts| format_epoch(ts as u64))
+                .unwrap_or_else(|| "N/A".to_string());
+            (u, a, first)
+        }
+        Err(_) => (0, 0, "N/A".to_string()),
+    };
+    format!(
+        "Your usage:\n\
+         Cost: ${cost:.4}\n\
+         Messages: {sent} sent, {received} received\n\
+         First message: {first_date}\n\
+         Current model: {model}"
+    )
+}
+
 fn cmd_audit() -> String {
     let actions = crate::audit::get_recent_actions(20);
     if actions.is_empty() {
@@ -309,6 +332,256 @@ fn cmd_audit() -> String {
     lines.join("\n")
 }
 
+fn cmd_pin(sender: &str, label: &str) -> String {
+    if label.is_empty() {
+        return "Usage: /pin <label>".to_string();
+    }
+    let Ok(conn) = crate::memory::open_memory_db(sender) else {
+        return "Failed to access memory.".to_string();
+    };
+    let messages = crate::memory::messages::get_recent_messages(
+        &conn,
+        crate::constants::PIN_MESSAGE_COUNT,
+    );
+    if messages.is_empty() {
+        return "No recent messages to pin.".to_string();
+    }
+    let content: String = messages
+        .iter()
+        .map(|(role, content, _)| format!("{role}: {content}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::memory::messages::save_pin(&conn, label, &content);
+    format!("Pinned {} messages as '{label}'", messages.len())
+}
+
+fn cmd_pins(sender: &str) -> String {
+    let Ok(conn) = crate::memory::open_memory_db(sender) else {
+        return "Failed to access memory.".to_string();
+    };
+    let pins = crate::memory::messages::list_pins(&conn);
+    if pins.is_empty() {
+        return "No saved pins.".to_string();
+    }
+    let mut lines = vec![format!("Saved pins ({}):", pins.len())];
+    for (label, ts) in &pins {
+        let date = format_epoch(*ts as u64);
+        lines.push(format!("  {label} ({date})"));
+    }
+    lines.join("\n")
+}
+
+fn cmd_recall(state: &State, sender: &str, label: &str) -> String {
+    if label.is_empty() {
+        return "Usage: /recall <label>".to_string();
+    }
+    let Ok(conn) = crate::memory::open_memory_db(sender) else {
+        return "Failed to access memory.".to_string();
+    };
+    match crate::memory::messages::get_pin(&conn, label) {
+        Some(content) => {
+            state
+                .pending_recalls
+                .insert(sender.to_string(), content);
+            format!("Recalled pin '{label}'. It will be included in your next message.")
+        }
+        None => format!("No pin named '{label}'. Use /pins to see available pins."),
+    }
+}
+
+fn cmd_remind(sender: &str, arg: &str) -> String {
+    let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+    if parts.len() < 2 || parts[0].is_empty() {
+        return "Usage: /remind <time> <message>\nExamples: /remind 5m Check the oven\n          /remind 1h Call dentist".to_string();
+    }
+    let duration = match crate::helpers::parse_duration(parts[0]) {
+        Some(d) => d,
+        None => return format!("Invalid time format: '{}'. Use 5m, 1h, 30s, 2d.", parts[0]),
+    };
+    let message = parts[1];
+    let deliver_at = crate::helpers::epoch_now() + duration.as_secs() as i64;
+    let Ok(conn) = crate::schedule::open_schedule_db() else {
+        return "Failed to access schedule database.".to_string();
+    };
+    let id = crate::schedule::add_reminder(&conn, sender, message, deliver_at);
+    let human = crate::helpers::format_duration_human(duration.as_secs());
+    format!("Reminder #{id} set for {human} from now: {message}")
+}
+
+fn cmd_reminders(sender: &str) -> String {
+    let Ok(conn) = crate::schedule::open_schedule_db() else {
+        return "Failed to access schedule database.".to_string();
+    };
+    let reminders = crate::schedule::get_pending_reminders(&conn, sender);
+    if reminders.is_empty() {
+        return "No pending reminders.".to_string();
+    }
+    let now = crate::helpers::epoch_now();
+    let mut lines = vec![format!("Pending reminders ({}):", reminders.len())];
+    for (id, message, deliver_at) in &reminders {
+        let remaining = (*deliver_at - now).max(0) as u64;
+        let human = crate::helpers::format_duration_human(remaining);
+        lines.push(format!("  #{id} - {message} (in {human})"));
+    }
+    lines.join("\n")
+}
+
+fn cmd_cancel_reminder(sender: &str, id_str: &str) -> String {
+    let id: i64 = match id_str.parse() {
+        Ok(id) => id,
+        Err(_) => return "Usage: /cancel <id>".to_string(),
+    };
+    let Ok(conn) = crate::schedule::open_schedule_db() else {
+        return "Failed to access schedule database.".to_string();
+    };
+    if crate::schedule::cancel_reminder(&conn, id, sender) {
+        format!("Reminder #{id} cancelled.")
+    } else {
+        format!("No pending reminder #{id} found for you.")
+    }
+}
+
+fn cmd_cron(sender: &str, arg: &str) -> String {
+    if arg.is_empty() {
+        return "Usage: /cron \"0 9 * * MON\" <message>\n       /cron 0 9 * * MON <message>\nAll times are UTC.".to_string();
+    }
+    // Parse quoted or unquoted cron pattern
+    let (pattern, message) = if arg.starts_with('"') {
+        // Quoted: /cron "0 9 * * MON" message
+        match arg[1..].find('"') {
+            Some(end) => {
+                let p = &arg[1..1 + end];
+                let msg = arg[1 + end + 1..].trim();
+                (p.to_string(), msg.to_string())
+            }
+            None => return "Missing closing quote. Usage: /cron \"0 9 * * *\" <message>".to_string(),
+        }
+    } else {
+        // Unquoted: assume exactly 5 fields then message
+        let parts: Vec<&str> = arg.splitn(6, ' ').collect();
+        if parts.len() < 6 {
+            return "Usage: /cron <min> <hour> <day> <month> <dow> <message>\n       /cron \"0 9 * * MON\" <message>".to_string();
+        }
+        let p = parts[..5].join(" ");
+        (p, parts[5].to_string())
+    };
+    if message.is_empty() {
+        return "Missing message. Usage: /cron \"0 9 * * *\" <message>".to_string();
+    }
+    let Ok(conn) = crate::schedule::open_schedule_db() else {
+        return "Failed to access schedule database.".to_string();
+    };
+    let id = crate::schedule::add_cron_job(&conn, sender, &message, &pattern);
+    if id == 0 {
+        return format!("Invalid cron pattern: \"{pattern}\"");
+    }
+    let desc = crate::helpers::format_cron_human(&pattern);
+    format!("Cron job #{id} created: {desc}\nMessage: {message}")
+}
+
+fn cmd_every(sender: &str, arg: &str) -> String {
+    let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+    if parts.len() < 2 || parts[0].is_empty() {
+        return "Usage: /every <interval> <message>\nExamples: /every 1h Check status\n          /every 30m Drink water".to_string();
+    }
+    let secs = match crate::helpers::parse_interval_secs(parts[0]) {
+        Some(s) => s,
+        None => return format!("Invalid interval: '{}'. Use 30s, 5m, 1h, 2d.", parts[0]),
+    };
+    let message = parts[1];
+    let Ok(conn) = crate::schedule::open_schedule_db() else {
+        return "Failed to access schedule database.".to_string();
+    };
+    let id = crate::schedule::add_interval_job(&conn, sender, message, secs);
+    let human = crate::helpers::format_duration_human(secs as u64);
+    format!("Interval job #{id} created: every {human}\nMessage: {message}")
+}
+
+fn cmd_daily(sender: &str, arg: &str) -> String {
+    let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+    if parts.len() < 2 || parts[0].is_empty() {
+        return "Usage: /daily <HH:MM> <message>\nExamples: /daily 09:00 Morning standup\n          /daily 17:30 EOD review\nAll times are UTC.".to_string();
+    }
+    let pattern = match crate::helpers::parse_daily_time(parts[0]) {
+        Some(p) => p,
+        None => return format!("Invalid time: '{}'. Use HH:MM format (e.g., 09:00).", parts[0]),
+    };
+    let message = parts[1];
+    let Ok(conn) = crate::schedule::open_schedule_db() else {
+        return "Failed to access schedule database.".to_string();
+    };
+    let id = crate::schedule::add_cron_job(&conn, sender, message, &pattern);
+    if id == 0 {
+        return "Failed to create daily job.".to_string();
+    }
+    format!("Daily job #{id} created: every day at {} UTC\nMessage: {message}", parts[0])
+}
+
+fn cmd_crons(sender: &str) -> String {
+    let Ok(conn) = crate::schedule::open_schedule_db() else {
+        return "Failed to access schedule database.".to_string();
+    };
+    let jobs = crate::schedule::get_active_cron_jobs(&conn, sender);
+    if jobs.is_empty() {
+        return "No active cron jobs.".to_string();
+    }
+    let mut lines = vec![format!("Active cron jobs ({}):", jobs.len())];
+    for (id, message, job_type, pattern, interval, _next_at) in &jobs {
+        let schedule = if *job_type == "cron" {
+            pattern.as_deref().map(crate::helpers::format_cron_human).unwrap_or_default()
+        } else {
+            interval.map(|s| format!("every {}", crate::helpers::format_duration_human(s as u64))).unwrap_or_default()
+        };
+        lines.push(format!("  #{id} [{job_type}] {schedule} — {message}"));
+    }
+    lines.join("\n")
+}
+
+fn cmd_cron_cancel(sender: &str, id_str: &str) -> String {
+    let id: i64 = match id_str.parse() {
+        Ok(id) => id,
+        Err(_) => return "Usage: /cron-cancel <id>".to_string(),
+    };
+    let Ok(conn) = crate::schedule::open_schedule_db() else {
+        return "Failed to access schedule database.".to_string();
+    };
+    if crate::schedule::cancel_cron_job(&conn, id, sender) {
+        format!("Cron job #{id} cancelled.")
+    } else {
+        format!("No cron job #{id} found for you.")
+    }
+}
+
+fn cmd_cron_pause(sender: &str, id_str: &str) -> String {
+    let id: i64 = match id_str.parse() {
+        Ok(id) => id,
+        Err(_) => return "Usage: /cron-pause <id>".to_string(),
+    };
+    let Ok(conn) = crate::schedule::open_schedule_db() else {
+        return "Failed to access schedule database.".to_string();
+    };
+    if crate::schedule::pause_cron_job(&conn, id, sender) {
+        format!("Cron job #{id} paused.")
+    } else {
+        format!("No active cron job #{id} found for you.")
+    }
+}
+
+fn cmd_cron_resume(sender: &str, id_str: &str) -> String {
+    let id: i64 = match id_str.parse() {
+        Ok(id) => id,
+        Err(_) => return "Usage: /cron-resume <id>".to_string(),
+    };
+    let Ok(conn) = crate::schedule::open_schedule_db() else {
+        return "Failed to access schedule database.".to_string();
+    };
+    if crate::schedule::resume_cron_job(&conn, id, sender) {
+        format!("Cron job #{id} resumed.")
+    } else {
+        format!("No paused cron job #{id} found for you.")
+    }
+}
+
 fn cmd_export(sender: &str) -> String {
     let Ok(conn) = crate::memory::open_memory_db(sender) else {
         return "No messages to export.".to_string();
@@ -327,6 +600,20 @@ fn cmd_help() -> String {
      /forget - Clear all stored memory\n\
      /search <query> - Search conversation history\n\
      /export - Export conversation history\n\
+     /usage - Show your personal usage stats\n\
+     /pin <label> - Pin recent messages with a label\n\
+     /pins - List saved pins\n\
+     /recall <label> - Recall a pinned conversation for context\n\
+     /remind <time> <msg> - Set a reminder (e.g., /remind 5m Check oven)\n\
+     /reminders - List your pending reminders\n\
+     /cancel <id> - Cancel a reminder\n\
+     /cron <pattern> <msg> - Create a cron job (e.g., /cron \"0 9 * * MON\" Standup)\n\
+     /every <interval> <msg> - Repeat every N time (e.g., /every 1h Check status)\n\
+     /daily <HH:MM> <msg> - Daily job at time UTC (e.g., /daily 09:00 Standup)\n\
+     /crons - List active cron jobs\n\
+     /cron-cancel <id> - Cancel a cron job\n\
+     /cron-pause <id> - Pause a cron job\n\
+     /cron-resume <id> - Resume a paused cron job\n\
      /audit - View recent admin actions\n\
      /pending - List blocked senders awaiting approval\n\
      /allow <id> - Approve a pending sender\n\
@@ -377,6 +664,59 @@ pub(crate) fn handle_command(state: &State, sender: &str, text: &str) -> Option<
     }
     if text == "/audit" {
         return Some(cmd_audit());
+    }
+    if text == "/usage" {
+        return Some(cmd_usage(state, sender));
+    }
+    if text == "/pin" || text.starts_with("/pin ") {
+        let label = text.strip_prefix("/pin").unwrap_or("").trim();
+        return Some(cmd_pin(sender, label));
+    }
+    if text == "/pins" {
+        return Some(cmd_pins(sender));
+    }
+    if text == "/recall" || text.starts_with("/recall ") {
+        let label = text.strip_prefix("/recall").unwrap_or("").trim();
+        return Some(cmd_recall(state, sender, label));
+    }
+    if text == "/remind" || text.starts_with("/remind ") {
+        let arg = text.strip_prefix("/remind").unwrap_or("").trim();
+        return Some(cmd_remind(sender, arg));
+    }
+    if text == "/reminders" {
+        return Some(cmd_reminders(sender));
+    }
+    if text == "/cancel" || text.starts_with("/cancel ") {
+        let arg = text.strip_prefix("/cancel").unwrap_or("").trim();
+        return Some(cmd_cancel_reminder(sender, arg));
+    }
+    // Cron commands: check more specific prefixes first to avoid /cron matching /crons etc.
+    if text == "/crons" {
+        return Some(cmd_crons(sender));
+    }
+    if text == "/cron-cancel" || text.starts_with("/cron-cancel ") {
+        let arg = text.strip_prefix("/cron-cancel").unwrap_or("").trim();
+        return Some(cmd_cron_cancel(sender, arg));
+    }
+    if text == "/cron-pause" || text.starts_with("/cron-pause ") {
+        let arg = text.strip_prefix("/cron-pause").unwrap_or("").trim();
+        return Some(cmd_cron_pause(sender, arg));
+    }
+    if text == "/cron-resume" || text.starts_with("/cron-resume ") {
+        let arg = text.strip_prefix("/cron-resume").unwrap_or("").trim();
+        return Some(cmd_cron_resume(sender, arg));
+    }
+    if text == "/cron" || text.starts_with("/cron ") {
+        let arg = text.strip_prefix("/cron").unwrap_or("").trim();
+        return Some(cmd_cron(sender, arg));
+    }
+    if text == "/every" || text.starts_with("/every ") {
+        let arg = text.strip_prefix("/every").unwrap_or("").trim();
+        return Some(cmd_every(sender, arg));
+    }
+    if text == "/daily" || text.starts_with("/daily ") {
+        let arg = text.strip_prefix("/daily").unwrap_or("").trim();
+        return Some(cmd_daily(sender, arg));
     }
     None
 }
@@ -455,10 +795,16 @@ pub(crate) async fn handle_message(
     let _ = state.set_typing(sender, true).await;
     let (session_id, model, lock, is_new_session) = state.get_or_create_session(sender);
 
-    let prompt = if is_new_session {
+    let base_prompt = if is_new_session {
         inject_context(sender, text)
     } else {
         text.to_string()
+    };
+    let recalled = state.pending_recalls.remove(sender).map(|(_, v)| v);
+    let prompt = if let Some(ref pin_content) = recalled {
+        format!("[Recalled context]\n{pin_content}\n\n[Current message]\n{base_prompt}")
+    } else {
+        base_prompt
     };
 
     let _guard = lock.lock().await;
@@ -480,6 +826,31 @@ pub(crate) async fn handle_message(
     if let Ok((ref response, _)) = result {
         info!(sender = %sender, response_len = response.len(), "Reply sent");
         store_message_pair(sender, text, response, &session_id);
+
+        // Increment session message count and check for auto-summarize
+        let should_summarize = {
+            if let Some(mut entry) = state.session_mgr.sessions.get_mut(sender) {
+                entry.message_count += 1;
+                if entry.message_count >= crate::constants::AUTO_SUMMARIZE_THRESHOLD {
+                    entry.message_count = 0;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if should_summarize {
+            if let Some(summary) = state
+                .claude_runner
+                .summarize_session(&session_id, &model)
+                .await
+            {
+                save_memory(sender, &summary);
+                info!(sender = %sender, "Auto-summarized mid-conversation");
+            }
+        }
     }
 
     send_claude_response(state, sender, result, &session_id, &prompt).await
@@ -532,6 +903,7 @@ async fn send_claude_response(
         }
         Err(e) => {
             state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
+            crate::webhook::fire_if_configured(&state.config.webhook_url, "error", sender, &e.to_string());
             // Enqueue for background retry
             if !original_prompt.is_empty() {
                 if let Ok(qconn) = crate::queue::open_queue_db() {
@@ -625,6 +997,21 @@ pub(crate) async fn retry_pending_messages(state: &State) {
         }
     }
     crate::queue::purge_completed(&qconn);
+}
+
+pub(crate) async fn deliver_due_reminders(state: &State) {
+    let Ok(conn) = crate::schedule::open_schedule_db() else {
+        return;
+    };
+    for (id, sender, message) in crate::schedule::get_due_reminders(&conn) {
+        let text = format!("Reminder: {message}");
+        if let Err(e) = state.send_message(&sender, &text).await {
+            warn!(sender = %sender, "Failed to deliver reminder: {e}");
+        } else {
+            crate::schedule::mark_delivered(&conn, id);
+        }
+    }
+    crate::schedule::purge_delivered(&conn);
 }
 
 #[cfg(test)]
@@ -949,6 +1336,7 @@ mod tests {
                 model: "sonnet".to_string(),
                 lock: Arc::new(Mutex::new(())),
                 last_activity: Instant::now(),
+                message_count: 0,
             },
         );
 
@@ -977,6 +1365,7 @@ mod tests {
                 model: "sonnet".to_string(),
                 lock: Arc::new(Mutex::new(())),
                 last_activity: Instant::now(),
+                message_count: 0,
             },
         );
         state
@@ -1136,6 +1525,7 @@ mod tests {
                 model: "sonnet".to_string(),
                 lock: Arc::new(Mutex::new(())),
                 last_activity: Instant::now(),
+                message_count: 0,
             },
         );
 
@@ -1513,7 +1903,8 @@ mod tests {
 
         retry_pending_messages(&state).await;
 
-        // Verify retry_count incremented
+        // Verify retry_count incremented (>= 1 because parallel tests may also
+        // process entries from the shared queue.db)
         let count: i64 = conn
             .query_row(
                 "SELECT retry_count FROM message_queue WHERE id = ?1",
@@ -1521,7 +1912,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1);
+        assert!(count >= 1, "retry_count should be >= 1, got {count}");
         // Cleanup
         crate::queue::mark_completed(&conn, id);
         crate::queue::purge_completed(&conn);
@@ -1586,5 +1977,630 @@ mod tests {
         let result = handle_message(&state, &sender, "tell me about nginx", &[]).await;
         assert!(result.is_ok());
         delete_memory(&sender);
+    }
+
+    // --- /usage command tests ---
+
+    #[test]
+    fn test_cmd_usage_with_no_history() {
+        let sender = format!("+usage_empty_{}", uuid::Uuid::new_v4());
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, &sender, "/usage").unwrap();
+        assert!(result.contains("0 sent, 0 received"), "got: {result}");
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_cmd_usage_with_cost() {
+        let sender = format!("+usage_cost_{}", uuid::Uuid::new_v4());
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        state.add_sender_cost(&sender, 0.1234);
+        let result = handle_command(&state, &sender, "/usage").unwrap();
+        assert!(result.contains("Cost: $0.1234"), "got: {result}");
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_cmd_usage_with_messages() {
+        let sender = format!("+usage_msgs_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        store_message(&conn, "user", "hello", "sess1");
+        store_message(&conn, "assistant", "hi there", "sess1");
+        store_message(&conn, "user", "how are you?", "sess1");
+        drop(conn);
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, &sender, "/usage").unwrap();
+        assert!(result.contains("2 sent, 1 received"), "got: {result}");
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_cmd_usage_shows_model() {
+        let sender = format!("+usage_model_{}", uuid::Uuid::new_v4());
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, &sender, "/usage").unwrap();
+        assert!(result.contains("Current model: sonnet"), "got: {result}");
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_cmd_usage_shows_first_message_date() {
+        let sender = format!("+usage_date_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        store_message(&conn, "user", "hello", "sess1");
+        drop(conn);
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, &sender, "/usage").unwrap();
+        assert!(result.contains("First message:"), "got: {result}");
+        assert!(!result.contains("N/A"), "expected a real date, got: {result}");
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_handle_command_usage() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, "+allowed_user", "/usage");
+        assert!(result.is_some());
+    }
+
+    // --- /pin, /pins, /recall tests ---
+
+    #[test]
+    fn test_save_pin_and_get() {
+        let sender = format!("+pin_rt_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        crate::memory::messages::save_pin(&conn, "test-label", "some content");
+        let content = crate::memory::messages::get_pin(&conn, "test-label");
+        assert_eq!(content, Some("some content".to_string()));
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_save_pin_overwrites_existing() {
+        let sender = format!("+pin_ow_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        crate::memory::messages::save_pin(&conn, "label", "first");
+        crate::memory::messages::save_pin(&conn, "label", "second");
+        assert_eq!(crate::memory::messages::get_pin(&conn, "label"), Some("second".to_string()));
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_list_pins_empty() {
+        let sender = format!("+pin_empty_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        let pins = crate::memory::messages::list_pins(&conn);
+        assert!(pins.is_empty());
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_list_pins_with_data() {
+        let sender = format!("+pin_list_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        crate::memory::messages::save_pin(&conn, "alpha", "content a");
+        crate::memory::messages::save_pin(&conn, "beta", "content b");
+        let pins = crate::memory::messages::list_pins(&conn);
+        assert_eq!(pins.len(), 2);
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_get_pin_missing() {
+        let sender = format!("+pin_miss_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        assert_eq!(crate::memory::messages::get_pin(&conn, "nonexistent"), None);
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_delete_pin() {
+        let sender = format!("+pin_del_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        crate::memory::messages::save_pin(&conn, "to-delete", "content");
+        crate::memory::messages::delete_pin(&conn, "to-delete");
+        assert_eq!(crate::memory::messages::get_pin(&conn, "to-delete"), None);
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_get_recent_messages() {
+        let sender = format!("+pin_recent_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        for i in 1..=5 {
+            store_message(&conn, "user", &format!("msg {i}"), "sess1");
+        }
+        let msgs = crate::memory::messages::get_recent_messages(&conn, 3);
+        assert_eq!(msgs.len(), 3);
+        // Should be in chronological order (oldest first)
+        assert!(msgs[0].1.contains("msg 3"));
+        assert!(msgs[2].1.contains("msg 5"));
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_cmd_pin_saves_recent() {
+        let sender = format!("+pin_cmd_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        store_message(&conn, "user", "hello", "sess1");
+        store_message(&conn, "assistant", "hi there", "sess1");
+        drop(conn);
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, &sender, "/pin test-label").unwrap();
+        assert!(result.contains("Pinned"), "got: {result}");
+        assert!(result.contains("test-label"), "got: {result}");
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_cmd_pins_lists_all() {
+        let sender = format!("+pins_list_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        crate::memory::messages::save_pin(&conn, "alpha", "content");
+        drop(conn);
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, &sender, "/pins").unwrap();
+        assert!(result.contains("Saved pins"), "got: {result}");
+        assert!(result.contains("alpha"), "got: {result}");
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_cmd_recall_returns_content() {
+        let sender = format!("+recall_cmd_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        crate::memory::messages::save_pin(&conn, "mypin", "pinned stuff");
+        drop(conn);
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, &sender, "/recall mypin").unwrap();
+        assert!(result.contains("Recalled pin 'mypin'"), "got: {result}");
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_cmd_recall_sets_pending() {
+        let sender = format!("+recall_pend_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        crate::memory::messages::save_pin(&conn, "context", "important info");
+        drop(conn);
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let _ = handle_command(&state, &sender, "/recall context");
+        assert!(state.pending_recalls.contains_key(&sender), "should set pending recall");
+        delete_memory(&sender);
+    }
+
+    #[test]
+    fn test_handle_command_pin() {
+        let sender = format!("+pin_handle_{}", uuid::Uuid::new_v4());
+        let conn = open_memory_db(&sender).unwrap();
+        store_message(&conn, "user", "hi", "sess1");
+        drop(conn);
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, &sender, "/pin label");
+        assert!(result.is_some());
+        delete_memory(&sender);
+    }
+
+    // --- auto-summarize tests ---
+
+    #[tokio::test]
+    async fn test_auto_summarize_triggers_at_threshold() {
+        let mut signal = MockSignalApi::new();
+        signal.expect_set_typing().returning(|_, _| Ok(()));
+        signal.expect_send_msg().returning(|_, _| Ok(()));
+        let mut claude = MockClaudeRunner::new();
+        claude.expect_run_claude()
+            .returning(|_, _, _, _, _, _, _| Ok(("ok".to_string(), None)));
+        claude.expect_summarize_session()
+            .times(1)
+            .returning(|_, _| Some("Summary".to_string()));
+        let state = test_state_with(signal, claude);
+        let sender = format!("+autosum_{}", uuid::Uuid::new_v4());
+        state.allowed_ids.insert(sender.clone(), ());
+        // Pre-populate session with message_count at threshold - 1
+        state.session_mgr.sessions.insert(sender.clone(), SenderState {
+            session_id: "sess".to_string(),
+            model: "sonnet".to_string(),
+            lock: Arc::new(Mutex::new(())),
+            last_activity: Instant::now(),
+            message_count: crate::constants::AUTO_SUMMARIZE_THRESHOLD - 1,
+        });
+        let _ = handle_message(&state, &sender, "trigger", &[]).await;
+        // summarize_session was called (verified by times(1))
+        delete_memory(&sender);
+    }
+
+    #[tokio::test]
+    async fn test_auto_summarize_does_not_trigger_below_threshold() {
+        let mut signal = MockSignalApi::new();
+        signal.expect_set_typing().returning(|_, _| Ok(()));
+        signal.expect_send_msg().returning(|_, _| Ok(()));
+        let mut claude = MockClaudeRunner::new();
+        claude.expect_run_claude()
+            .returning(|_, _, _, _, _, _, _| Ok(("ok".to_string(), None)));
+        claude.expect_summarize_session().never();
+        let state = test_state_with(signal, claude);
+        let _ = handle_message(&state, "+allowed_user", "hi", &[]).await;
+        // summarize_session should not have been called
+    }
+
+    #[tokio::test]
+    async fn test_auto_summarize_resets_counter() {
+        let mut signal = MockSignalApi::new();
+        signal.expect_set_typing().returning(|_, _| Ok(()));
+        signal.expect_send_msg().returning(|_, _| Ok(()));
+        let mut claude = MockClaudeRunner::new();
+        claude.expect_run_claude()
+            .returning(|_, _, _, _, _, _, _| Ok(("ok".to_string(), None)));
+        claude.expect_summarize_session()
+            .returning(|_, _| Some("Summary".to_string()));
+        let state = test_state_with(signal, claude);
+        let sender = format!("+autosum_reset_{}", uuid::Uuid::new_v4());
+        state.allowed_ids.insert(sender.clone(), ());
+        state.session_mgr.sessions.insert(sender.clone(), SenderState {
+            session_id: "sess".to_string(),
+            model: "sonnet".to_string(),
+            lock: Arc::new(Mutex::new(())),
+            last_activity: Instant::now(),
+            message_count: crate::constants::AUTO_SUMMARIZE_THRESHOLD - 1,
+        });
+        let _ = handle_message(&state, &sender, "trigger", &[]).await;
+        let count = state.session_mgr.sessions.get(&sender).unwrap().message_count;
+        assert_eq!(count, 0, "counter should reset after summarize");
+        delete_memory(&sender);
+    }
+
+    #[tokio::test]
+    async fn test_auto_summarize_counter_increments() {
+        let mut signal = MockSignalApi::new();
+        signal.expect_set_typing().returning(|_, _| Ok(()));
+        signal.expect_send_msg().returning(|_, _| Ok(()));
+        let mut claude = MockClaudeRunner::new();
+        claude.expect_run_claude()
+            .returning(|_, _, _, _, _, _, _| Ok(("ok".to_string(), None)));
+        claude.expect_summarize_session().never();
+        let state = test_state_with(signal, claude);
+        let _ = handle_message(&state, "+allowed_user", "msg1", &[]).await;
+        let count = state.session_mgr.sessions.get("+allowed_user").unwrap().message_count;
+        assert_eq!(count, 1, "counter should be 1 after one message");
+    }
+
+    #[test]
+    fn test_sender_state_message_count_initializes_zero() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let (_, _, _, _) = state.get_or_create_session("+fresh");
+        let count = state.session_mgr.sessions.get("+fresh").unwrap().message_count;
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_auto_summarize_handles_summarize_failure() {
+        let mut signal = MockSignalApi::new();
+        signal.expect_set_typing().returning(|_, _| Ok(()));
+        signal.expect_send_msg().returning(|_, _| Ok(()));
+        let mut claude = MockClaudeRunner::new();
+        claude.expect_run_claude()
+            .returning(|_, _, _, _, _, _, _| Ok(("ok".to_string(), None)));
+        claude.expect_summarize_session()
+            .returning(|_, _| None); // summarize fails
+        let state = test_state_with(signal, claude);
+        let sender = format!("+autosum_fail_{}", uuid::Uuid::new_v4());
+        state.allowed_ids.insert(sender.clone(), ());
+        state.session_mgr.sessions.insert(sender.clone(), SenderState {
+            session_id: "sess".to_string(),
+            model: "sonnet".to_string(),
+            lock: Arc::new(Mutex::new(())),
+            last_activity: Instant::now(),
+            message_count: crate::constants::AUTO_SUMMARIZE_THRESHOLD - 1,
+        });
+        // Should not panic even when summarize returns None
+        let result = handle_message(&state, &sender, "trigger", &[]).await;
+        assert!(result.is_ok());
+        delete_memory(&sender);
+    }
+
+    #[tokio::test]
+    async fn test_auto_summarize_saves_memory() {
+        let mut signal = MockSignalApi::new();
+        signal.expect_set_typing().returning(|_, _| Ok(()));
+        signal.expect_send_msg().returning(|_, _| Ok(()));
+        let mut claude = MockClaudeRunner::new();
+        claude.expect_run_claude()
+            .returning(|_, _, _, _, _, _, _| Ok(("ok".to_string(), None)));
+        claude.expect_summarize_session()
+            .returning(|_, _| Some("Auto-summary content".to_string()));
+        let state = test_state_with(signal, claude);
+        let sender = format!("+autosum_save_{}", uuid::Uuid::new_v4());
+        state.allowed_ids.insert(sender.clone(), ());
+        state.session_mgr.sessions.insert(sender.clone(), SenderState {
+            session_id: "sess".to_string(),
+            model: "sonnet".to_string(),
+            lock: Arc::new(Mutex::new(())),
+            last_activity: Instant::now(),
+            message_count: crate::constants::AUTO_SUMMARIZE_THRESHOLD - 1,
+        });
+        let _ = handle_message(&state, &sender, "trigger", &[]).await;
+        // Verify memory was saved
+        let status = crate::memory::memory_status(&sender);
+        assert!(status.contains("Auto-summary"), "expected summary in memory, got: {status}");
+        delete_memory(&sender);
+    }
+
+    #[tokio::test]
+    async fn test_auto_summarize_does_not_reset_session() {
+        let mut signal = MockSignalApi::new();
+        signal.expect_set_typing().returning(|_, _| Ok(()));
+        signal.expect_send_msg().returning(|_, _| Ok(()));
+        let mut claude = MockClaudeRunner::new();
+        claude.expect_run_claude()
+            .returning(|_, _, _, _, _, _, _| Ok(("ok".to_string(), None)));
+        claude.expect_summarize_session()
+            .returning(|_, _| Some("Summary".to_string()));
+        let state = test_state_with(signal, claude);
+        let sender = format!("+autosum_nores_{}", uuid::Uuid::new_v4());
+        state.allowed_ids.insert(sender.clone(), ());
+        state.session_mgr.sessions.insert(sender.clone(), SenderState {
+            session_id: "original-session".to_string(),
+            model: "sonnet".to_string(),
+            lock: Arc::new(Mutex::new(())),
+            last_activity: Instant::now(),
+            message_count: crate::constants::AUTO_SUMMARIZE_THRESHOLD - 1,
+        });
+        let _ = handle_message(&state, &sender, "trigger", &[]).await;
+        let session_id = state.session_mgr.sessions.get(&sender).unwrap().session_id.clone();
+        assert_eq!(session_id, "original-session", "session_id should not change");
+        delete_memory(&sender);
+    }
+
+    // --- scheduled reminders command tests ---
+
+    #[test]
+    fn test_cmd_remind_success() {
+        let sender = "+remind_ok";
+        let result = cmd_remind(sender, "5m Check the oven");
+        assert!(result.contains("Reminder #"), "should confirm reminder: {result}");
+        assert!(result.contains("5 minutes"), "should show human time: {result}");
+        assert!(result.contains("Check the oven"), "should echo message: {result}");
+    }
+
+    #[test]
+    fn test_cmd_remind_invalid_time() {
+        let result = cmd_remind("+user", "xyz Do something");
+        assert!(result.contains("Invalid time format"), "should reject bad time: {result}");
+    }
+
+    #[test]
+    fn test_cmd_remind_missing_message() {
+        let result = cmd_remind("+user", "");
+        assert!(result.contains("Usage:"), "should show usage: {result}");
+    }
+
+    #[test]
+    fn test_cmd_reminders_empty() {
+        let sender = format!("+rem_empty_{}", uuid::Uuid::new_v4());
+        let result = cmd_reminders(&sender);
+        assert_eq!(result, "No pending reminders.");
+    }
+
+    #[test]
+    fn test_cmd_cancel_reminder_success() {
+        let sender = "+cancel_ok";
+        // Create a reminder first
+        let create_result = cmd_remind(sender, "1h Cancel me");
+        let id: i64 = create_result
+            .split('#')
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .expect("should parse reminder id");
+        let result = cmd_cancel_reminder(sender, &id.to_string());
+        assert!(result.contains("cancelled"), "should confirm cancel: {result}");
+    }
+
+    #[test]
+    fn test_cmd_cancel_reminder_not_found() {
+        let sender = format!("+cancel_nf_{}", uuid::Uuid::new_v4());
+        let result = cmd_cancel_reminder(&sender, "99999");
+        assert!(result.contains("No pending reminder"), "should say not found: {result}");
+    }
+
+    #[test]
+    fn test_handle_command_remind() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, "+user", "/remind 5m test");
+        assert!(result.is_some(), "/remind should be handled");
+    }
+
+    #[test]
+    fn test_handle_command_reminders() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, "+user", "/reminders");
+        assert!(result.is_some(), "/reminders should be handled");
+    }
+
+    #[test]
+    fn test_handle_command_cancel() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, "+user", "/cancel 1");
+        assert!(result.is_some(), "/cancel should be handled");
+    }
+
+    // --- Cron command tests ---
+
+    #[test]
+    fn test_cmd_cron_success() {
+        let sender = format!("+cron_ok_{}", std::process::id());
+        let result = cmd_cron(&sender, "\"0 9 * * *\" Daily standup");
+        assert!(result.contains("Cron job #"), "should confirm: {result}");
+        assert!(result.contains("Daily standup"), "should echo message: {result}");
+    }
+
+    #[test]
+    fn test_cmd_cron_unquoted() {
+        let sender = format!("+cron_unq_{}", std::process::id());
+        let result = cmd_cron(&sender, "0 9 * * MON Monday check");
+        assert!(result.contains("Cron job #"), "should accept unquoted: {result}");
+    }
+
+    #[test]
+    fn test_cmd_cron_invalid() {
+        let result = cmd_cron("+user", "\"not valid\" msg");
+        assert!(result.contains("Invalid cron pattern"), "should reject bad pattern: {result}");
+    }
+
+    #[test]
+    fn test_cmd_cron_missing_msg() {
+        let result = cmd_cron("+user", "");
+        assert!(result.contains("Usage:"), "should show usage: {result}");
+    }
+
+    #[test]
+    fn test_cmd_every_hourly() {
+        let sender = format!("+every_ok_{}", std::process::id());
+        let result = cmd_every(&sender, "1h Check status");
+        assert!(result.contains("Interval job #"), "should confirm: {result}");
+        assert!(result.contains("1 hours"), "should show human time: {result}");
+    }
+
+    #[test]
+    fn test_cmd_every_invalid() {
+        let result = cmd_every("+user", "xyz Do something");
+        assert!(result.contains("Invalid interval"), "should reject bad interval: {result}");
+    }
+
+    #[test]
+    fn test_cmd_every_missing_msg() {
+        let result = cmd_every("+user", "");
+        assert!(result.contains("Usage:"), "should show usage: {result}");
+    }
+
+    #[test]
+    fn test_cmd_daily_valid() {
+        let sender = format!("+daily_ok_{}", std::process::id());
+        let result = cmd_daily(&sender, "09:00 Morning standup");
+        assert!(result.contains("Daily job #"), "should confirm: {result}");
+        assert!(result.contains("09:00 UTC"), "should show time: {result}");
+    }
+
+    #[test]
+    fn test_cmd_daily_invalid_time() {
+        let result = cmd_daily("+user", "25:99 Bad time");
+        assert!(result.contains("Invalid time"), "should reject bad time: {result}");
+    }
+
+    #[test]
+    fn test_cmd_daily_missing_msg() {
+        let result = cmd_daily("+user", "");
+        assert!(result.contains("Usage:"), "should show usage: {result}");
+    }
+
+    #[test]
+    fn test_cmd_crons_empty() {
+        let sender = format!("+crons_empty_{}", uuid::Uuid::new_v4());
+        let result = cmd_crons(&sender);
+        assert_eq!(result, "No active cron jobs.");
+    }
+
+    #[test]
+    fn test_cmd_crons_with_jobs() {
+        let sender = format!("+crons_list_{}", std::process::id());
+        cmd_every(&sender, "1h Check");
+        let result = cmd_crons(&sender);
+        assert!(result.contains("Active cron jobs"), "should list jobs: {result}");
+        assert!(result.contains("Check"), "should show message: {result}");
+    }
+
+    #[test]
+    fn test_cmd_cron_cancel_success() {
+        let sender = format!("+cc_ok_{}", std::process::id());
+        let create = cmd_every(&sender, "1h Cancel me");
+        let id: i64 = create.split('#').nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .expect("should parse id");
+        let result = cmd_cron_cancel(&sender, &id.to_string());
+        assert!(result.contains("cancelled"), "should confirm cancel: {result}");
+    }
+
+    #[test]
+    fn test_cmd_cron_cancel_not_found() {
+        let sender = format!("+cc_nf_{}", uuid::Uuid::new_v4());
+        let result = cmd_cron_cancel(&sender, "99999");
+        assert!(result.contains("No cron job"), "should say not found: {result}");
+    }
+
+    #[test]
+    fn test_cmd_cron_pause_and_resume() {
+        let sender = format!("+cp_ok_{}", std::process::id());
+        let create = cmd_every(&sender, "1h Pause me");
+        let id: i64 = create.split('#').nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .expect("should parse id");
+        let pause_result = cmd_cron_pause(&sender, &id.to_string());
+        assert!(pause_result.contains("paused"), "should confirm pause: {pause_result}");
+        let resume_result = cmd_cron_resume(&sender, &id.to_string());
+        assert!(resume_result.contains("resumed"), "should confirm resume: {resume_result}");
+    }
+
+    // --- handle_command wiring tests ---
+
+    #[test]
+    fn test_handle_command_cron() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, "+user", "/cron \"0 9 * * *\" test");
+        assert!(result.is_some(), "/cron should be handled");
+    }
+
+    #[test]
+    fn test_handle_command_every() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, "+user", "/every 1h test");
+        assert!(result.is_some(), "/every should be handled");
+    }
+
+    #[test]
+    fn test_handle_command_daily() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, "+user", "/daily 09:00 test");
+        assert!(result.is_some(), "/daily should be handled");
+    }
+
+    #[test]
+    fn test_handle_command_crons() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, "+user", "/crons");
+        assert!(result.is_some(), "/crons should be handled");
+    }
+
+    #[test]
+    fn test_handle_command_cron_cancel() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, "+user", "/cron-cancel 1");
+        assert!(result.is_some(), "/cron-cancel should be handled");
+    }
+
+    #[test]
+    fn test_handle_command_cron_pause() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, "+user", "/cron-pause 1");
+        assert!(result.is_some(), "/cron-pause should be handled");
+    }
+
+    #[test]
+    fn test_handle_command_cron_resume() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, "+user", "/cron-resume 1");
+        assert!(result.is_some(), "/cron-resume should be handled");
+    }
+
+    #[test]
+    fn test_handle_command_help_includes_cron() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let result = handle_command(&state, "+user", "/help").unwrap();
+        assert!(result.contains("/cron"), "help should mention /cron: {result}");
+        assert!(result.contains("/every"), "help should mention /every: {result}");
+        assert!(result.contains("/daily"), "help should mention /daily: {result}");
+        assert!(result.contains("/crons"), "help should mention /crons: {result}");
     }
 }
