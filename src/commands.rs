@@ -476,6 +476,7 @@ fn cmd_cron(sender: &str, arg: &str) -> String {
         return format!("Invalid cron pattern: \"{pattern}\"");
     }
     let desc = crate::helpers::format_cron_human(&pattern);
+    crate::audit::log_action("cron_create", sender, &format!("#{id} cron {pattern}"));
     format!("Cron job #{id} created: {desc}\nMessage: {message}")
 }
 
@@ -494,6 +495,7 @@ fn cmd_every(sender: &str, arg: &str) -> String {
     };
     let id = crate::schedule::add_interval_job(&conn, sender, message, secs);
     let human = crate::helpers::format_duration_human(secs as u64);
+    crate::audit::log_action("cron_create", sender, &format!("#{id} interval {human}"));
     format!("Interval job #{id} created: every {human}\nMessage: {message}")
 }
 
@@ -514,6 +516,7 @@ fn cmd_daily(sender: &str, arg: &str) -> String {
     if id == 0 {
         return "Failed to create daily job.".to_string();
     }
+    crate::audit::log_action("cron_create", sender, &format!("#{id} daily {}", parts[0]));
     format!("Daily job #{id} created: every day at {} UTC\nMessage: {message}", parts[0])
 }
 
@@ -546,6 +549,7 @@ fn cmd_cron_cancel(sender: &str, id_str: &str) -> String {
         return "Failed to access schedule database.".to_string();
     };
     if crate::schedule::cancel_cron_job(&conn, id, sender) {
+        crate::audit::log_action("cron_cancel", sender, &format!("#{id}"));
         format!("Cron job #{id} cancelled.")
     } else {
         format!("No cron job #{id} found for you.")
@@ -561,6 +565,7 @@ fn cmd_cron_pause(sender: &str, id_str: &str) -> String {
         return "Failed to access schedule database.".to_string();
     };
     if crate::schedule::pause_cron_job(&conn, id, sender) {
+        crate::audit::log_action("cron_pause", sender, &format!("#{id}"));
         format!("Cron job #{id} paused.")
     } else {
         format!("No active cron job #{id} found for you.")
@@ -576,6 +581,7 @@ fn cmd_cron_resume(sender: &str, id_str: &str) -> String {
         return "Failed to access schedule database.".to_string();
     };
     if crate::schedule::resume_cron_job(&conn, id, sender) {
+        crate::audit::log_action("cron_resume", sender, &format!("#{id}"));
         format!("Cron job #{id} resumed.")
     } else {
         format!("No paused cron job #{id} found for you.")
