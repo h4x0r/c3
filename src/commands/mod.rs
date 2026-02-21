@@ -129,100 +129,39 @@ pub(crate) fn buffer_debounced(state: &Arc<State>, reply_to: &str, message_text:
 pub(crate) fn handle_command(state: &State, sender: &str, text: &str) -> Option<String> {
     let text = text.trim();
     // /reset and /more are handled in handle_message (need async)
-    if text == "/help" {
-        return Some(cmd_help());
+    let (cmd, arg) = match text.split_once(' ') {
+        Some((c, a)) => (c, a.trim()),
+        None => (text, ""),
+    };
+    match cmd {
+        "/help" => Some(cmd_help()),
+        "/status" => Some(cmd_status(state, sender)),
+        "/pending" => Some(cmd_pending(state)),
+        "/allow" => Some(cmd_allow(state, arg)),
+        "/revoke" => Some(cmd_revoke(state, arg)),
+        "/model" => Some(cmd_model(state, sender, arg)),
+        "/memory" => Some(memory_status(sender)),
+        "/forget" => Some(forget_with_counts(sender)),
+        "/search" => Some(cmd_search(sender, arg)),
+        "/export-config" => Some(export_config(&state.allowed_ids, &state.config.account)),
+        "/export" => Some(cmd_export(sender)),
+        "/audit" => Some(cmd_audit()),
+        "/usage" => Some(cmd_usage(state, sender)),
+        "/pin" => Some(cmd_pin(sender, arg)),
+        "/pins" => Some(cmd_pins(sender)),
+        "/recall" => Some(cmd_recall(state, sender, arg)),
+        "/remind" => Some(cmd_remind(sender, arg)),
+        "/reminders" => Some(cmd_reminders(sender)),
+        "/cancel" => Some(cmd_cancel_reminder(sender, arg)),
+        "/crons" => Some(cmd_crons(sender)),
+        "/cron-cancel" => Some(cmd_cron_cancel(sender, arg)),
+        "/cron-pause" => Some(cmd_cron_pause(sender, arg)),
+        "/cron-resume" => Some(cmd_cron_resume(sender, arg)),
+        "/cron" => Some(cmd_cron(sender, arg)),
+        "/every" => Some(cmd_every(sender, arg)),
+        "/daily" => Some(cmd_daily(sender, arg)),
+        _ => None,
     }
-    if text == "/status" {
-        return Some(cmd_status(state, sender));
-    }
-    if text == "/pending" {
-        return Some(cmd_pending(state));
-    }
-    if let Some(arg) = text.strip_prefix("/allow ") {
-        return Some(cmd_allow(state, arg.trim()));
-    }
-    if text == "/allow" {
-        return Some(cmd_allow(state, ""));
-    }
-    if let Some(id) = text.strip_prefix("/revoke ") {
-        return Some(cmd_revoke(state, id.trim()));
-    }
-    if let Some(model) = text.strip_prefix("/model ") {
-        return Some(cmd_model(state, sender, model));
-    }
-    if text == "/memory" {
-        return Some(memory_status(sender));
-    }
-    if text == "/forget" {
-        return Some(forget_with_counts(sender));
-    }
-    if text == "/search" || text.starts_with("/search ") {
-        let query = text.strip_prefix("/search").unwrap_or("").trim();
-        return Some(cmd_search(sender, query));
-    }
-    if text == "/export-config" {
-        return Some(export_config(&state.allowed_ids, &state.config.account));
-    }
-    if text == "/export" {
-        return Some(cmd_export(sender));
-    }
-    if text == "/audit" {
-        return Some(cmd_audit());
-    }
-    if text == "/usage" {
-        return Some(cmd_usage(state, sender));
-    }
-    if text == "/pin" || text.starts_with("/pin ") {
-        let label = text.strip_prefix("/pin").unwrap_or("").trim();
-        return Some(cmd_pin(sender, label));
-    }
-    if text == "/pins" {
-        return Some(cmd_pins(sender));
-    }
-    if text == "/recall" || text.starts_with("/recall ") {
-        let label = text.strip_prefix("/recall").unwrap_or("").trim();
-        return Some(cmd_recall(state, sender, label));
-    }
-    if text == "/remind" || text.starts_with("/remind ") {
-        let arg = text.strip_prefix("/remind").unwrap_or("").trim();
-        return Some(cmd_remind(sender, arg));
-    }
-    if text == "/reminders" {
-        return Some(cmd_reminders(sender));
-    }
-    if text == "/cancel" || text.starts_with("/cancel ") {
-        let arg = text.strip_prefix("/cancel").unwrap_or("").trim();
-        return Some(cmd_cancel_reminder(sender, arg));
-    }
-    // Cron commands: check more specific prefixes first to avoid /cron matching /crons etc.
-    if text == "/crons" {
-        return Some(cmd_crons(sender));
-    }
-    if text == "/cron-cancel" || text.starts_with("/cron-cancel ") {
-        let arg = text.strip_prefix("/cron-cancel").unwrap_or("").trim();
-        return Some(cmd_cron_cancel(sender, arg));
-    }
-    if text == "/cron-pause" || text.starts_with("/cron-pause ") {
-        let arg = text.strip_prefix("/cron-pause").unwrap_or("").trim();
-        return Some(cmd_cron_pause(sender, arg));
-    }
-    if text == "/cron-resume" || text.starts_with("/cron-resume ") {
-        let arg = text.strip_prefix("/cron-resume").unwrap_or("").trim();
-        return Some(cmd_cron_resume(sender, arg));
-    }
-    if text == "/cron" || text.starts_with("/cron ") {
-        let arg = text.strip_prefix("/cron").unwrap_or("").trim();
-        return Some(cmd_cron(sender, arg));
-    }
-    if text == "/every" || text.starts_with("/every ") {
-        let arg = text.strip_prefix("/every").unwrap_or("").trim();
-        return Some(cmd_every(sender, arg));
-    }
-    if text == "/daily" || text.starts_with("/daily ") {
-        let arg = text.strip_prefix("/daily").unwrap_or("").trim();
-        return Some(cmd_daily(sender, arg));
-    }
-    None
 }
 
 async fn handle_more(state: &State, sender: &str) -> Result<(), AppError> {
