@@ -88,7 +88,7 @@ pub(crate) fn classify_attachment(content_type: &str) -> AttachmentType {
     }
 }
 
-#[allow(dead_code)] // voice_note used in tests; will be used for voice-vs-audio distinction
+#[derive(Debug, PartialEq)]
 pub(crate) struct AttachmentInfo {
     pub(crate) id: String,
     pub(crate) content_type: String,

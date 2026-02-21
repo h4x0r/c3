@@ -418,6 +418,64 @@ async fn main() {
     }
 }
 
+// --- Message routing ---
+
+/// The routing decision for an incoming Signal message, separated from I/O.
+#[derive(Debug, PartialEq)]
+enum MessageRoute {
+    /// Message was an echo of something we sent; suppress it.
+    EchoSuppressed,
+    /// Sender is not on the allowed list.
+    Unauthorized { source: String, source_name: String },
+    /// Message should be handled directly (command, attachment, or debounce disabled).
+    HandleDirect {
+        reply_to: String,
+        text: String,
+        attachments: Vec<signal::AttachmentInfo>,
+    },
+    /// Message should be buffered for debounce merging.
+    Debounce { reply_to: String, text: String },
+}
+
+/// Determine how to route an incoming message. Pure decision logic, no I/O.
+fn route_message(state: &State, envelope: &ParsedEnvelope) -> MessageRoute {
+    let msg_hash = helpers::hash_message(&envelope.message_text);
+    if state.sent_hashes.remove(&msg_hash).is_some() {
+        return MessageRoute::EchoSuppressed;
+    }
+
+    if !envelope.is_sync
+        && !state.is_allowed(&envelope.source)
+        && !state.is_allowed(&envelope.source_uuid)
+    {
+        return MessageRoute::Unauthorized {
+            source: envelope.source.clone(),
+            source_name: envelope.source_name.clone(),
+        };
+    }
+
+    let reply_to = if envelope.is_sync {
+        state.config.account.clone()
+    } else {
+        envelope.source.clone()
+    };
+
+    let has_attachments = !envelope.attachments.is_empty();
+
+    if is_command(&envelope.message_text) || state.config.debounce_ms == 0 || has_attachments {
+        MessageRoute::HandleDirect {
+            reply_to,
+            text: envelope.message_text.clone(),
+            attachments: Vec::new(), // raw attachments are passed separately
+        }
+    } else {
+        MessageRoute::Debounce {
+            reply_to,
+            text: envelope.message_text.clone(),
+        }
+    }
+}
+
 // --- WebSocket message loop ---
 
 async fn connect_and_listen(state: &Arc<State>) -> Result<(), AppError> {
@@ -461,60 +519,60 @@ async fn connect_and_listen(state: &Arc<State>) -> Result<(), AppError> {
             None => continue,
         };
 
-        let ParsedEnvelope {
-            source,
-            message_text,
-            is_sync,
-            source_uuid,
-            source_name,
-            attachments: raw_attachments,
-        } = parsed_env;
+        match route_message(state, &parsed_env) {
+            MessageRoute::EchoSuppressed => {
+                debug!(
+                    "Suppressed echo: {}",
+                    truncate(&parsed_env.message_text, 40)
+                );
+            }
+            MessageRoute::Unauthorized {
+                source,
+                source_name,
+            } => {
+                handle_unauthorized(state, &source, &source_name);
+            }
+            MessageRoute::HandleDirect { reply_to, text, .. } => {
+                state.metrics.message_count.fetch_add(1, Ordering::Relaxed);
+                webhook::fire_if_configured(
+                    &state.config.webhook_url,
+                    "message_received",
+                    &parsed_env.source,
+                    "",
+                );
 
-        // Suppress Note to Self echoes
-        let msg_hash = helpers::hash_message(&message_text);
-        if state.sent_hashes.remove(&msg_hash).is_some() {
-            debug!("Suppressed echo: {}", truncate(&message_text, 40));
-            continue;
-        }
-
-        if !is_sync && !state.is_allowed(&source) && !state.is_allowed(&source_uuid) {
-            handle_unauthorized(state, &source, &source_name);
-            continue;
-        }
-
-        state.metrics.message_count.fetch_add(1, Ordering::Relaxed);
-        webhook::fire_if_configured(&state.config.webhook_url, "message_received", &source, "");
-
-        let reply_to = if is_sync {
-            state.config.account.clone()
-        } else {
-            source.clone()
-        };
-
-        let has_attachments = !raw_attachments.is_empty();
-        if has_attachments {
-            info!(sender = %source, attachment_count = raw_attachments.len(), message_type = "attachment", "Incoming message");
-        } else {
-            info!(sender = %source, message_type = "text", "Incoming message");
-        }
-
-        if is_command(&message_text) || state.config.debounce_ms == 0 || has_attachments {
-            let state = Arc::clone(state);
-            tokio::spawn(async move {
-                let (file_paths, has_audio) =
-                    download_attachments(&state, &reply_to, &raw_attachments).await;
-                let final_text = if has_audio {
-                    voice_prompt(&message_text)
+                let raw_atts: Vec<_> = parsed_env.attachments;
+                let has_attachments = !raw_atts.is_empty();
+                if has_attachments {
+                    info!(sender = %parsed_env.source, attachment_count = raw_atts.len(), message_type = "attachment", "Incoming message");
                 } else {
-                    message_text
-                };
-                if let Err(e) = handle_message(&state, &reply_to, &final_text, &file_paths).await {
-                    error!("Error handling message from {reply_to}: {e}");
-                    let _ = state.send_message(&reply_to, &format!("Error: {e}")).await;
+                    info!(sender = %parsed_env.source, message_type = "text", "Incoming message");
                 }
-            });
-        } else {
-            buffer_debounced(state, &reply_to, &message_text);
+
+                let state = Arc::clone(state);
+                tokio::spawn(async move {
+                    let (file_paths, has_audio) =
+                        download_attachments(&state, &reply_to, &raw_atts).await;
+                    let final_text = if has_audio { voice_prompt(&text) } else { text };
+                    if let Err(e) =
+                        handle_message(&state, &reply_to, &final_text, &file_paths).await
+                    {
+                        error!("Error handling message from {reply_to}: {e}");
+                        let _ = state.send_message(&reply_to, &format!("Error: {e}")).await;
+                    }
+                });
+            }
+            MessageRoute::Debounce { reply_to, text } => {
+                state.metrics.message_count.fetch_add(1, Ordering::Relaxed);
+                webhook::fire_if_configured(
+                    &state.config.webhook_url,
+                    "message_received",
+                    &parsed_env.source,
+                    "",
+                );
+                info!(sender = %parsed_env.source, message_type = "text", "Incoming message");
+                buffer_debounced(state, &reply_to, &text);
+            }
         }
     }
 
@@ -609,5 +667,154 @@ mod tests {
         let args =
             Args::try_parse_from(["ccchat", "--account", "+1234567890"]).expect("parse failed");
         assert!(args.config.is_none());
+    }
+
+    // --- route_message tests ---
+
+    use crate::signal::AttachmentInfo;
+    use crate::state::tests::test_state_with;
+    use crate::traits::{MockClaudeRunner, MockSignalApi};
+
+    fn make_envelope(source: &str, text: &str, is_sync: bool) -> ParsedEnvelope {
+        ParsedEnvelope {
+            source: source.to_string(),
+            message_text: text.to_string(),
+            is_sync,
+            source_uuid: "".to_string(),
+            source_name: "Test".to_string(),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_route_echo_suppressed() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        // Pre-insert the hash so it looks like we sent this message
+        let hash = helpers::hash_message("Hello from bot");
+        state.sent_hashes.insert(hash, ());
+        let env = make_envelope("+allowed_user", "Hello from bot", false);
+        assert_eq!(route_message(&state, &env), MessageRoute::EchoSuppressed);
+    }
+
+    #[test]
+    fn test_route_unauthorized_sender() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        let env = make_envelope("+unknown_number", "Hi there", false);
+        assert_eq!(
+            route_message(&state, &env),
+            MessageRoute::Unauthorized {
+                source: "+unknown_number".to_string(),
+                source_name: "Test".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_route_allowed_sender_direct() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        // debounce_ms is 0 in test state, so all messages go HandleDirect
+        let env = make_envelope("+allowed_user", "Hi Claude", false);
+        match route_message(&state, &env) {
+            MessageRoute::HandleDirect { reply_to, text, .. } => {
+                assert_eq!(reply_to, "+allowed_user");
+                assert_eq!(text, "Hi Claude");
+            }
+            other => panic!("expected HandleDirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_route_sync_message_reply_to_account() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        // Sync messages (Note to Self) should always be allowed and reply to account
+        let env = make_envelope("+allowed_user", "/status", true);
+        match route_message(&state, &env) {
+            MessageRoute::HandleDirect { reply_to, text, .. } => {
+                assert_eq!(reply_to, "+1234567890"); // account from test_state_with
+                assert_eq!(text, "/status");
+            }
+            other => panic!("expected HandleDirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_route_command_always_direct_even_with_debounce() {
+        let mut state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        state.config.debounce_ms = 3000; // Enable debounce
+        let env = make_envelope("+allowed_user", "/help", false);
+        match route_message(&state, &env) {
+            MessageRoute::HandleDirect { text, .. } => assert_eq!(text, "/help"),
+            other => panic!("expected HandleDirect for command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_route_debounce_when_enabled() {
+        let mut state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        state.config.debounce_ms = 3000; // Enable debounce
+        let env = make_envelope("+allowed_user", "Hello", false);
+        match route_message(&state, &env) {
+            MessageRoute::Debounce { reply_to, text } => {
+                assert_eq!(reply_to, "+allowed_user");
+                assert_eq!(text, "Hello");
+            }
+            other => panic!("expected Debounce, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_route_attachment_always_direct_even_with_debounce() {
+        let mut state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        state.config.debounce_ms = 3000;
+        let env = ParsedEnvelope {
+            source: "+allowed_user".to_string(),
+            message_text: "Check this".to_string(),
+            is_sync: false,
+            source_uuid: "".to_string(),
+            source_name: "Test".to_string(),
+            attachments: vec![AttachmentInfo {
+                id: "att1".to_string(),
+                content_type: "image/png".to_string(),
+                filename: Some("photo.png".to_string()),
+                voice_note: false,
+            }],
+        };
+        match route_message(&state, &env) {
+            MessageRoute::HandleDirect { text, .. } => assert_eq!(text, "Check this"),
+            other => panic!("expected HandleDirect for attachment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_route_sync_bypasses_auth_check() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        // Source is not in allowed_ids, but is_sync=true should bypass auth
+        let env = make_envelope("+unknown_sync", "Note to self", true);
+        match route_message(&state, &env) {
+            MessageRoute::HandleDirect { reply_to, .. } => {
+                assert_eq!(reply_to, "+1234567890"); // account
+            }
+            other => panic!("expected HandleDirect for sync, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_route_allowed_by_uuid() {
+        let state = test_state_with(MockSignalApi::new(), MockClaudeRunner::new());
+        state.allowed_ids.insert("uuid-known-user".to_string(), ());
+        let env = ParsedEnvelope {
+            source: "+not_in_allowed".to_string(),
+            message_text: "Hi".to_string(),
+            is_sync: false,
+            source_uuid: "uuid-known-user".to_string(),
+            source_name: "UUID User".to_string(),
+            attachments: Vec::new(),
+        };
+        match route_message(&state, &env) {
+            MessageRoute::HandleDirect { reply_to, .. } => {
+                assert_eq!(reply_to, "+not_in_allowed");
+            }
+            other => panic!("expected HandleDirect via UUID match, got {other:?}"),
+        }
     }
 }
