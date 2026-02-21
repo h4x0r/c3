@@ -342,6 +342,54 @@ async fn run_conversation(
     send_claude_response(state, sender, result, &session_id, &prompt).await
 }
 
+/// Send any file references embedded in a Claude response as Signal attachments.
+async fn send_file_attachments(state: &State, sender: &str, response: &str) {
+    let file_refs = crate::helpers::extract_file_references(response);
+    for file_path in &file_refs {
+        match std::fs::read(file_path) {
+            Ok(data) => {
+                let ct = crate::helpers::content_type_from_extension(file_path);
+                let fname = file_path.file_name().unwrap_or_default().to_string_lossy();
+                if let Err(e) = state
+                    .signal_api
+                    .send_attachment(sender, &data, ct, &fname)
+                    .await
+                {
+                    warn!(sender = %sender, file = %file_path.display(), "Attachment send failed: {e}");
+                }
+            }
+            Err(e) => {
+                warn!(sender = %sender, file = %file_path.display(), "Failed to read file: {e}")
+            }
+        }
+    }
+}
+
+/// Handle a Claude error: increment counter, fire webhook, enqueue retry, notify user.
+async fn handle_claude_error(
+    state: &State,
+    sender: &str,
+    error: AppError,
+    original_prompt: &str,
+) -> Result<(), AppError> {
+    state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
+    crate::webhook::fire_if_configured(
+        &state.config.webhook_url,
+        "error",
+        sender,
+        &error.to_string(),
+    );
+    if !original_prompt.is_empty() {
+        if let Ok(qconn) = crate::queue::open_queue_db() {
+            crate::queue::enqueue(&qconn, sender, original_prompt, "[]");
+        }
+    }
+    state
+        .send_message(sender, &format!("Claude error: {error}"))
+        .await?;
+    Ok(())
+}
+
 /// Send a Claude response: check truncation, store session for /more if needed, send to user.
 /// On error, enqueues the original prompt for background retry.
 async fn send_claude_response(
@@ -370,47 +418,10 @@ async fn send_claude_response(
                 state.session_mgr.truncated_sessions.remove(sender);
                 state.send_long_message(sender, &response).await?;
             }
-            // Send any file references as attachments
-            let file_refs = crate::helpers::extract_file_references(&response);
-            for file_path in &file_refs {
-                match std::fs::read(file_path) {
-                    Ok(data) => {
-                        let ct = crate::helpers::content_type_from_extension(file_path);
-                        let fname = file_path.file_name().unwrap_or_default().to_string_lossy();
-                        if let Err(e) = state
-                            .signal_api
-                            .send_attachment(sender, &data, ct, &fname)
-                            .await
-                        {
-                            warn!(sender = %sender, file = %file_path.display(), "Attachment send failed: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(sender = %sender, file = %file_path.display(), "Failed to read file: {e}")
-                    }
-                }
-            }
+            send_file_attachments(state, sender, &response).await;
             Ok(())
         }
-        Err(e) => {
-            state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
-            crate::webhook::fire_if_configured(
-                &state.config.webhook_url,
-                "error",
-                sender,
-                &e.to_string(),
-            );
-            // Enqueue for background retry
-            if !original_prompt.is_empty() {
-                if let Ok(qconn) = crate::queue::open_queue_db() {
-                    crate::queue::enqueue(&qconn, sender, original_prompt, "[]");
-                }
-            }
-            state
-                .send_message(sender, &format!("Claude error: {e}"))
-                .await?;
-            Ok(())
-        }
+        Err(e) => handle_claude_error(state, sender, e, original_prompt).await,
     }
 }
 

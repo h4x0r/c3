@@ -1823,3 +1823,145 @@ async fn test_deliver_due_cron_jobs_skips_on_send_failure() {
         .unwrap();
     assert!(next <= now, "should NOT advance on send failure");
 }
+
+// --- send_file_attachments tests ---
+
+#[tokio::test]
+async fn test_send_file_attachments_sends_existing_file() {
+    let dir = std::path::PathBuf::from("/tmp/ccchat");
+    let _ = std::fs::create_dir_all(&dir);
+    let test_file = dir.join(format!("sfa_test_{}.png", std::process::id()));
+    std::fs::write(&test_file, b"png bytes").unwrap();
+
+    let mut signal = MockSignalApi::new();
+    signal
+        .expect_send_attachment()
+        .withf(|_, data, ct, _| data == b"png bytes" && ct == "image/png")
+        .times(1)
+        .returning(|_, _, _, _| Ok(()));
+    let state = test_state_with(signal, MockClaudeRunner::new());
+
+    let response = format!("Here is the file: {}", test_file.display());
+    send_file_attachments(&state, "+user", &response).await;
+    let _ = std::fs::remove_file(&test_file);
+}
+
+#[tokio::test]
+async fn test_send_file_attachments_no_refs_sends_nothing() {
+    let signal = MockSignalApi::new();
+    // No expect_send_attachment → panics if called
+    let state = test_state_with(signal, MockClaudeRunner::new());
+    send_file_attachments(&state, "+user", "Just a plain response.").await;
+}
+
+#[tokio::test]
+async fn test_send_file_attachments_missing_file_does_not_panic() {
+    let signal = MockSignalApi::new();
+    let state = test_state_with(signal, MockClaudeRunner::new());
+    // Reference a file that doesn't exist — should warn, not panic
+    send_file_attachments(&state, "+user", "See /tmp/ccchat/nonexistent_abc.txt").await;
+}
+
+#[tokio::test]
+async fn test_send_file_attachments_multiple_files() {
+    let dir = std::path::PathBuf::from("/tmp/ccchat");
+    let _ = std::fs::create_dir_all(&dir);
+    let pid = std::process::id();
+    let f1 = dir.join(format!("multi1_{pid}.png"));
+    let f2 = dir.join(format!("multi2_{pid}.txt"));
+    std::fs::write(&f1, b"img").unwrap();
+    std::fs::write(&f2, b"txt").unwrap();
+
+    let mut signal = MockSignalApi::new();
+    signal
+        .expect_send_attachment()
+        .times(2)
+        .returning(|_, _, _, _| Ok(()));
+    let state = test_state_with(signal, MockClaudeRunner::new());
+
+    let response = format!("Files: {} and {}", f1.display(), f2.display());
+    send_file_attachments(&state, "+user", &response).await;
+    let _ = std::fs::remove_file(&f1);
+    let _ = std::fs::remove_file(&f2);
+}
+
+#[tokio::test]
+async fn test_send_file_attachments_send_failure_does_not_propagate() {
+    let dir = std::path::PathBuf::from("/tmp/ccchat");
+    let _ = std::fs::create_dir_all(&dir);
+    let test_file = dir.join(format!("sfa_fail_{}.png", std::process::id()));
+    std::fs::write(&test_file, b"data").unwrap();
+
+    let mut signal = MockSignalApi::new();
+    signal
+        .expect_send_attachment()
+        .returning(|_, _, _, _| Err("network error".into()));
+    let state = test_state_with(signal, MockClaudeRunner::new());
+
+    // Should not panic even though send_attachment fails
+    let response = format!("File: {}", test_file.display());
+    send_file_attachments(&state, "+user", &response).await;
+    let _ = std::fs::remove_file(&test_file);
+}
+
+// --- handle_claude_error tests ---
+
+#[tokio::test]
+async fn test_handle_claude_error_increments_error_count() {
+    let mut signal = MockSignalApi::new();
+    signal.expect_send_msg().returning(|_, _| Ok(()));
+    let state = test_state_with(signal, MockClaudeRunner::new());
+    let err = crate::error::AppError::Claude("boom".to_string());
+    let _ = handle_claude_error(&state, "+user", err, "").await;
+    assert_eq!(state.metrics.error_count.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn test_handle_claude_error_sends_user_message() {
+    let mut signal = MockSignalApi::new();
+    signal
+        .expect_send_msg()
+        .withf(|_, msg| msg.contains("Claude error") && msg.contains("model overloaded"))
+        .times(1)
+        .returning(|_, _| Ok(()));
+    let state = test_state_with(signal, MockClaudeRunner::new());
+    let err = crate::error::AppError::Claude("model overloaded".to_string());
+    let result = handle_claude_error(&state, "+user", err, "").await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_handle_claude_error_enqueues_retry_when_prompt_present() {
+    let mut signal = MockSignalApi::new();
+    signal.expect_send_msg().returning(|_, _| Ok(()));
+    let state = test_state_with(signal, MockClaudeRunner::new());
+    let err = crate::error::AppError::Claude("fail".to_string());
+    let _ = handle_claude_error(&state, "+retry_enq_test", err, "important question").await;
+    // Verify it was enqueued
+    let conn = crate::queue::open_queue_db().unwrap();
+    let pending = crate::queue::get_pending(&conn);
+    let found = pending
+        .iter()
+        .any(|(_, s, c, _)| s == "+retry_enq_test" && c == "important question");
+    assert!(found, "prompt should be enqueued for retry");
+    // Cleanup
+    for (id, s, _, _) in &pending {
+        if s == "+retry_enq_test" {
+            crate::queue::mark_completed(&conn, *id);
+        }
+    }
+    crate::queue::purge_completed(&conn);
+}
+
+#[tokio::test]
+async fn test_handle_claude_error_skips_enqueue_when_prompt_empty() {
+    let mut signal = MockSignalApi::new();
+    signal.expect_send_msg().returning(|_, _| Ok(()));
+    let state = test_state_with(signal, MockClaudeRunner::new());
+    let err = crate::error::AppError::Claude("fail".to_string());
+    let _ = handle_claude_error(&state, "+skip_enq_test", err, "").await;
+    let conn = crate::queue::open_queue_db().unwrap();
+    let pending = crate::queue::get_pending(&conn);
+    let found = pending.iter().any(|(_, s, _, _)| s == "+skip_enq_test");
+    assert!(!found, "empty prompt should not be enqueued");
+}
